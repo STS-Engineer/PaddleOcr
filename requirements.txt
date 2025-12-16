@@ -1,0 +1,7 @@
+Flask
+requests
+psycopg2-binary
+PyMuPDF
+opencv-python-headless
+paddlepaddle
+paddleocr
