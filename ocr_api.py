@@ -63,7 +63,7 @@ def init_models():
             lang="ch",
             use_doc_orientation_classify=True, 
             use_doc_unwarping=False,            
-            use_textline_orientation=False     
+            use_textline_orientation=True     
         )
         
         # Orientation Classification Model
@@ -132,7 +132,7 @@ def run_paddle_ocr_on_file(img_path: Path):
             str(img_path),
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
-            use_textline_orientation=False,
+            use_textline_orientation=True,
             text_det_limit_side_len=2048,
             text_det_limit_type="max",
             text_det_thresh=0.2,
