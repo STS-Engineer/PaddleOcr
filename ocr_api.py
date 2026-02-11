@@ -456,23 +456,33 @@ def process_pdf_to_ocr():
     if not request.is_json:
         return jsonify({
             "success": False,
-            "error": "JSON required. Provide 'download_link' OR 'openai_file_id'"
+            "error": "JSON required. Provide 'openaiFileIdRefs', 'download_link' OR 'openai_file_id'"
         }), 400
 
     data = request.get_json()
-    download_link = data.get("download_link")        # preferred (temp link 30 min)
-    openai_file_id = data.get("openai_file_id")      # fallback
+    
+    # Handle openaiFileIdRefs array (Claude's format)
+    openai_file_id_refs = data.get("openaiFileIdRefs")
+    download_link = data.get("download_link")
+    openai_file_id = data.get("openai_file_id")
     max_pages = int(data.get("max_pages", 20))
+    original_filename = None
+
+    # Extract from openaiFileIdRefs if present (priority #1)
+    if openai_file_id_refs and isinstance(openai_file_id_refs, list) and len(openai_file_id_refs) > 0:
+        first_ref = openai_file_id_refs[0]
+        download_link = first_ref.get("download_link")
+        original_filename = first_ref.get("name", "uploaded.pdf")
+        logging.info(f"Using openaiFileIdRefs: {original_filename}")
 
     if not download_link and not openai_file_id:
         return jsonify({
             "success": False,
-            "error": "Missing 'download_link' or 'openai_file_id'"
+            "error": "Missing 'openaiFileIdRefs', 'download_link' or 'openai_file_id'"
         }), 400
 
     timestamp = int(time.time())
     local_pdf_path = None
-    original_filename = None
 
     try:
         # -----------------------------
@@ -482,6 +492,7 @@ def process_pdf_to_ocr():
 
         # A) preferred: direct download link (temp 30 min)
         if download_link:
+            logging.info(f"Downloading from link: {download_link[:100]}...")
             r = requests.get(download_link, stream=True, timeout=60)
             if r.status_code != 200:
                 return jsonify({
@@ -490,15 +501,18 @@ def process_pdf_to_ocr():
                 }), 400
             pdf_bytes = r.content
 
-            # optional: try to infer filename from URL path
-            try:
-                p = urllib.parse.urlparse(download_link).path
-                original_filename = Path(p).name or "uploaded.pdf"
-            except Exception:
-                original_filename = "uploaded.pdf"
+            # Use original_filename if already set from openaiFileIdRefs
+            if not original_filename:
+                # Try to infer filename from URL path
+                try:
+                    p = urllib.parse.urlparse(download_link).path
+                    original_filename = Path(p).name or "uploaded.pdf"
+                except Exception:
+                    original_filename = "uploaded.pdf"
 
         # B) fallback: OpenAI Files API
         if pdf_bytes is None and openai_file_id:
+            logging.info(f"Using OpenAI file ID: {openai_file_id}")
             file_metadata = client.files.retrieve(openai_file_id)
             original_filename = getattr(file_metadata, "filename", None) or "uploaded.pdf"
             pdf_bytes = client.files.content(openai_file_id).read()
@@ -521,10 +535,12 @@ def process_pdf_to_ocr():
         with open(local_pdf_path, "wb") as f:
             f.write(pdf_bytes)
 
+        logging.info(f"PDF saved to: {local_pdf_path}")
+
         # -----------------------------
         # 3) OCR
         # -----------------------------
-        cleanup_old_files(OUTPUT_FOLDER)  # keeps your existing output images cleanup (24h)
+        cleanup_old_files(OUTPUT_FOLDER)
         doc = fitz.open(local_pdf_path)
         total_pages = len(doc)
         mat = fitz.Matrix(2.0, 2.0)
@@ -555,10 +571,9 @@ def process_pdf_to_ocr():
 
         doc.close()
 
-        # keep response compatible
         return jsonify({
             "success": True,
-            "openai_file_id": openai_file_id,              # can be None if using download_link
+            "openai_file_id": openai_file_id,
             "download_link_used": bool(download_link),
             "material_name": material_name,
             "total_pages": total_pages,
@@ -572,11 +587,7 @@ def process_pdf_to_ocr():
         return jsonify({"success": False, "error": str(e)}), 500
 
     finally:
-        # Option 2: keep file up to 30 min (cleanup thread will delete it)
-        # If you want to delete immediately after OCR, uncomment below:
-        # if local_pdf_path and local_pdf_path.exists():
-        #     with contextlib.suppress(Exception):
-        #         os.remove(local_pdf_path)
+        # Temp PDF will be cleaned by background thread after 30 min
         pass
 
 
