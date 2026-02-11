@@ -148,38 +148,60 @@ def serve_temp_file(filename):
 @app.route("/upload-temp-pdf", methods=["POST"])
 def upload_temp_pdf():
     """
-    JSON:
-      - download_link: Azure SAS URL (preferred)
-      - filename: optional name for material extraction/debug
-      OR
-      - openai_file_id: fallback (if you still have OpenAI Files)
+    JSON accepté (ordre de priorité):
+      1) openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ]
+      2) download_link: Azure SAS URL (preferred)
+      3) openai_file_id: fallback OpenAI Files API
+
     Returns:
       - temp_filename + temp_url (valid until cleanup ~30 min)
     """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
 
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
+
+    # --- NEW: accept openaiFileIdRefs ---
+    refs = data.get("openaiFileIdRefs")
     download_link = data.get("download_link")
     openai_file_id = data.get("openai_file_id")
     original_name = data.get("filename") or "uploaded.pdf"
 
+    # If openaiFileIdRefs is provided, it has priority
+    if refs and isinstance(refs, list) and len(refs) > 0:
+        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
+
+        # Prefer download_link if present
+        dl = first_ref.get("download_link")
+        if dl:
+            download_link = dl
+
+        # Keep file id as fallback
+        fid = first_ref.get("id")
+        if fid and not openai_file_id:
+            openai_file_id = fid
+
+        # Try to use original filename
+        ref_name = first_ref.get("name")
+        if ref_name:
+            original_name = ref_name
+
     if not download_link and not openai_file_id:
         return jsonify({
             "success": False,
-            "error": "Provide 'download_link' (Azure SAS) or 'openai_file_id'"
+            "error": "Provide 'openaiFileIdRefs', 'download_link' (Azure SAS) or 'openai_file_id'"
         }), 400
 
     try:
         pdf_bytes = None
 
-        # 1) Preferred: download from Azure SAS
+        # 1) Preferred: download from link (Azure SAS OR Actions temp link)
         if download_link:
             r = requests.get(download_link, stream=True, timeout=60)
             if r.status_code != 200:
                 return jsonify({
                     "success": False,
-                    "error": f"Failed to download from Azure (status={r.status_code})"
+                    "error": f"Failed to download from link (status={r.status_code}). Maybe expired?"
                 }), 400
             pdf_bytes = r.content
 
@@ -189,6 +211,9 @@ def upload_temp_pdf():
             if getattr(file_metadata, "filename", None):
                 original_name = file_metadata.filename
             pdf_bytes = client.files.content(openai_file_id).read()
+
+        if pdf_bytes is None:
+            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
 
         # Save temp file
         safe = secure_filename(original_name) or "uploaded.pdf"
@@ -213,6 +238,7 @@ def upload_temp_pdf():
     except Exception as e:
         logging.error(f"Temp upload failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 def save_upright_image(in_path: Path, out_path: Path) -> int:
     """
