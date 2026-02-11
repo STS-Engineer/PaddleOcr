@@ -18,9 +18,16 @@ import fitz  # PyMuPDF
 import cv2
 from paddleocr import PaddleOCR, DocImgOrientationClassification
 
+import re
+from openai import OpenAI
+from psycopg2.extras import Json
+
 # --- CONFIGURATION ---
 UPLOAD_FOLDER = Path('/tmp/uploads')
 OUTPUT_FOLDER = Path('/tmp/output_images')
+
+DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
+client = OpenAI()
 
 # DB Config
 DB_CONFIG = {
@@ -89,6 +96,20 @@ def cleanup_old_files(folder, max_age_hours=24):
                     os.remove(file_path)
     except Exception:
         pass # Silent fail is fine for cleanup
+
+
+def extract_material_name_from_filename(filename: str) -> str:
+    stem = Path(filename).stem
+    s = re.sub(r"[_\-]+", " ", stem).strip()
+
+    s = re.sub(r"(?i)^\s*data\s*sheet\s*", "", s)
+    s = re.sub(r"(?i)^\s*datasheet\s*", "", s)
+    s = re.sub(r"(?i)^\s*technical\s*data\s*sheet\s*", "", s)
+    s = re.sub(r"(?i)^\s*fiche\s*technique\s*", "", s)
+    s = re.sub(r"(?i)^\s*fiche\s*de\s*donn[eé]es\s*", "", s)
+
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or "UNKNOWN"
 
 def save_upright_image(in_path: Path, out_path: Path) -> int:
     """
@@ -327,6 +348,141 @@ def process_rfq_id_to_images():
         if local_pdf_path and local_pdf_path.exists():
             with contextlib.suppress(Exception):
                 os.remove(local_pdf_path)
+@app.route("/process-pdf-to-ocr", methods=["POST"])
+def process_pdf_to_ocr():
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON required. Please provide 'openai_file_id'"}), 400
+
+    data = request.get_json()
+    openai_file_id = data.get("openai_file_id")
+    max_pages = int(data.get("max_pages", 20))
+
+    if not openai_file_id:
+        return jsonify({"success": False, "error": "Missing 'openai_file_id'"}), 400
+
+    timestamp = int(time.time())
+    local_pdf_path = UPLOAD_FOLDER / f"openai_{timestamp}_{openai_file_id}.pdf"
+
+    try:
+        file_metadata = client.files.retrieve(openai_file_id)
+        original_filename = file_metadata.filename
+        material_name = extract_material_name_from_filename(original_filename)
+
+        content = client.files.content(openai_file_id).read()
+        with open(local_pdf_path, "wb") as f:
+            f.write(content)
+
+        cleanup_old_files(OUTPUT_FOLDER)
+        doc = fitz.open(local_pdf_path)
+        total_pages = len(doc)
+        mat = fitz.Matrix(2.0, 2.0)
+
+        processed_pages = []
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+
+            pix = page.get_pixmap(matrix=mat)
+            raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
+            raw_path = OUTPUT_FOLDER / raw_filename
+            pix.save(str(raw_path))
+
+            upright_filename = f"oa_upright_{i+1}_{timestamp}.png"
+            upright_path = OUTPUT_FOLDER / upright_filename
+            angle = save_upright_image(raw_path, upright_path)
+            raw_path.unlink(missing_ok=True)
+
+            ocr_text_list = run_paddle_ocr_on_file(upright_path)
+
+            processed_pages.append({
+                "page": i + 1,
+                "rotation_angle": angle,
+                "ocr_text": ocr_text_list
+            })
+
+        doc.close()
+
+        return jsonify({
+            "success": True,
+            "openai_file_id": openai_file_id,
+            "material_name": material_name,
+            "total_pages": total_pages,
+            "converted_pages": len(processed_pages),
+            "truncated": total_pages > max_pages,
+            "pages": processed_pages
+        }), 200
+
+    except Exception as e:
+        logging.error(f"OpenAI PDF Process Error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    finally:
+        if local_pdf_path and local_pdf_path.exists():
+            with contextlib.suppress(Exception):
+                os.remove(local_pdf_path)
+
+@app.route("/save-ocr-result", methods=["POST"])
+def save_ocr_result():
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON required"}), 400
+
+    data = request.get_json()
+    material_name = data.get("material_name")
+    pages = data.get("pages")
+    source = data.get("source_type", "datasheet")
+
+    if not material_name or not pages:
+        return jsonify({"success": False, "error": "Missing material_name or pages"}), 400
+
+    type_matiere = data.get("type_matiere") or material_name
+    specs_json = {
+        "material_name": material_name,
+        "pages": [{"page": p.get("page"), "ocr_text": p.get("ocr_text", [])} for p in pages]
+    }
+
+    try:
+        matiere_id, fiche_id = save_material_and_fiche(material_name, type_matiere, specs_json, source)
+        return jsonify({"success": True, "matiere_id": matiere_id, "fiche_id": fiche_id, "source": source}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s", (material_name,))
+                row = cur.fetchone()
+                if row:
+                    matiere_id = row[0]
+                    cur.execute(
+                        "UPDATE public.matieres SET type_matiere = %s, date_mise_a_jour = NOW() WHERE matiere_id = %s",
+                        (type_matiere, matiere_id)
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO public.matieres (nom_matiere, type_matiere, date_creation, date_mise_a_jour) "
+                        "VALUES (%s, %s, NOW(), NOW()) RETURNING matiere_id",
+                        (material_name, type_matiere)
+                    )
+                    matiere_id = cur.fetchone()[0]
+
+                cur.execute(
+                    "INSERT INTO public.fiches_matieres (matiere_id, date_creation_fiche, derniere_modification) "
+                    "VALUES (%s, NOW(), NOW()) RETURNING fiche_id",
+                    (matiere_id,)
+                )
+                fiche_id = cur.fetchone()[0]
+
+                cur.execute(
+                    """INSERT INTO public.specifications (fiche_id, source_type, donnees, date_creation, derniere_modification)
+                       VALUES (%s, %s, %s, NOW(), NOW())""",
+                    (fiche_id, source, Json(specs_json))
+                )
+
+        return matiere_id, fiche_id
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     logging.info("Starting RFQ Processing API on port 5000")
