@@ -205,17 +205,35 @@ def process_rfq_id_to_images():
     download_url_page_1 = None
 
     try:
-        # 1. DB Fetch
-        logging.info(f"Fetching RFQ: {rfq_id}")
+        # 1. DB Fetch & Search for Drawing
+        logging.info(f"Fetching RFQ and searching for drawing: {rfq_id}")
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
-        cur.execute("SELECT rfq_file_path FROM public.main WHERE rfq_id = %s", (rfq_id,))
-        result = cur.fetchone()
-
-        if not result or not result[0]:
-            return jsonify({"success": False, "error": "RFQ ID not found"}), 404
         
-        rfq_path_db = result[0]
+        # We query the file path column. We use ILIKE to find rows where 'drawing' 
+        # exists anywhere in that path string.
+        query = "SELECT rfq_file_path FROM public.main WHERE rfq_id = %s"
+        cur.execute(query, (rfq_id,))
+        result = cur.fetchone()
+        
+        if not result or not result[0]:
+            return jsonify({"success": False, "error": "RFQ ID or File Path not found"}), 404
+        
+        # result[0] looks like: "{/path/file1.pdf,/path/Drawing_abc.pdf}"
+        raw_paths = result[0].strip("{}").split(",")
+        
+        # Logic to prioritize the file containing 'drawing'
+        rfq_path_db = None
+        for path in raw_paths:
+            if 'drawing' in path.lower():
+                rfq_path_db = path.strip()
+                break
+        
+        # Fallback to the first file if no 'drawing' is found
+        if not rfq_path_db and raw_paths:
+            rfq_path_db = raw_paths[0].strip()
+        
+        logging.info(f"Target file identified: {rfq_path_db}")
         
         # 2. GitHub Download
         clean_path = rfq_path_db.strip("/")
