@@ -60,7 +60,7 @@ def init_models():
         logging.info("Loading PaddleOCR (lang=ch)...")
         # Main OCR Engine
         paddle_engine = PaddleOCR(
-            lang="ch",
+            lang="multilingual",
             use_doc_orientation_classify=True, 
             use_doc_unwarping=False,            
             use_textline_orientation=True     
