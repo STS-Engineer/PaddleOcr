@@ -58,11 +58,19 @@ def init_models():
     
     try:
         logging.info("Loading PaddleOCR (lang=ch)...")
+        
+        # Disable OneDNN/MKLDNN to avoid backend issues
+        import paddle
+        paddle.set_flags({'FLAGS_use_mkldnn': False})
+        
         # Main OCR Engine
         paddle_engine = PaddleOCR(
+            lang="ch",
             use_doc_orientation_classify=True, 
             use_doc_unwarping=False,            
-            use_textline_orientation=True     
+            use_textline_orientation=True,
+            enable_mkldnn=False,  # Explicitly disable MKLDNN
+            use_gpu=False  # Ensure CPU mode
         )
         
         # Orientation Classification Model
