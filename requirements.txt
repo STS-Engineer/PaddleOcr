@@ -4,6 +4,6 @@ requests==2.31.0
 psycopg2-binary==2.9.9
 PyMuPDF==1.23.8
 opencv-python-headless==4.8.1.78
-paddlepaddle==2.6.1
-paddleocr==2.7.3
+paddlepaddle==3.0.0
+paddleocr==2.8.1
 paddlex==3.0.0b2
