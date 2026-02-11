@@ -105,7 +105,7 @@ def save_upright_image(in_path: Path, out_path: Path) -> int:
     if doc_ori is None:
         return -1
 
-    out = doc_ori.predict(str(in_path), batch_size=1)
+    out = doc_ori.ocr(str(in_path), batch_size=1)
     if not out:
         return -1
 
@@ -135,7 +135,7 @@ def run_paddle_ocr_on_file(img_path: Path):
         return []
 
     try:
-        result = paddle_engine.predict(
+        result = paddle_engine.ocr(
             str(img_path),
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
