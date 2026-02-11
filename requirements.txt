@@ -1,7 +1,9 @@
-Flask
-requests
-psycopg2-binary
-PyMuPDF
-opencv-python-headless
-paddlepaddle
-paddleocr
+Flask==3.0.0
+Werkzeug==3.0.1
+requests==2.31.0
+psycopg2-binary==2.9.9
+PyMuPDF==1.23.8
+opencv-python-headless==4.8.1.78
+paddlepaddle==2.6.1
+paddleocr==2.7.3
+paddlex==3.0.0b2
