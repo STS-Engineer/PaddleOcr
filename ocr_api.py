@@ -22,12 +22,19 @@ import re
 from openai import OpenAI
 from psycopg2.extras import Json
 
+import uuid
+from threading import Thread
+from flask import send_from_directory
+
 # --- CONFIGURATION ---
 UPLOAD_FOLDER = Path('/tmp/uploads')
 OUTPUT_FOLDER = Path('/tmp/output_images')
 
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 client = OpenAI()
+
+TEMP_PDF_FOLDER = Path('/tmp/temp_pdfs')  # TTL 30 min
+TEMP_PDF_FOLDER.mkdir(exist_ok=True, parents=True)
 
 # DB Config
 DB_CONFIG = {
@@ -98,6 +105,25 @@ def cleanup_old_files(folder, max_age_hours=24):
         pass # Silent fail is fine for cleanup
 
 
+def cleanup_temp_pdfs(interval_seconds=300, max_age_seconds=30 * 60):
+    """Delete temp pdfs older than 30 minutes."""
+    while True:
+        now = time.time()
+        try:
+            for f in TEMP_PDF_FOLDER.iterdir():
+                if not f.is_file():
+                    continue
+                age = now - f.stat().st_mtime
+                if age > max_age_seconds:
+                    with contextlib.suppress(Exception):
+                        f.unlink()
+        except Exception:
+            pass
+        time.sleep(interval_seconds)
+
+Thread(target=cleanup_temp_pdfs, daemon=True).start()
+
+
 def extract_material_name_from_filename(filename: str) -> str:
     stem = Path(filename).stem
     s = re.sub(r"[_\-]+", " ", stem).strip()
@@ -110,6 +136,82 @@ def extract_material_name_from_filename(filename: str) -> str:
 
     s = re.sub(r"\s+", " ", s).strip()
     return s or "UNKNOWN"
+
+@app.route("/temp_files/<path:filename>", methods=["GET"])
+def serve_temp_file(filename):
+    try:
+        return send_from_directory(str(TEMP_UPLOAD_FOLDER), filename)
+    except Exception:
+        return jsonify({"success": False, "error": "temp_file_not_found"}), 404
+
+@app.route("/upload-temp-pdf", methods=["POST"])
+def upload_temp_pdf():
+    """
+    JSON:
+      - download_link: Azure SAS URL (preferred)
+      - filename: optional name for material extraction/debug
+      OR
+      - openai_file_id: fallback (if you still have OpenAI Files)
+    Returns:
+      - temp_filename + temp_url (valid until cleanup ~30 min)
+    """
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON required"}), 400
+
+    data = request.get_json()
+    download_link = data.get("download_link")
+    openai_file_id = data.get("openai_file_id")
+    original_name = data.get("filename") or "uploaded.pdf"
+
+    if not download_link and not openai_file_id:
+        return jsonify({
+            "success": False,
+            "error": "Provide 'download_link' (Azure SAS) or 'openai_file_id'"
+        }), 400
+
+    try:
+        pdf_bytes = None
+
+        # 1) Preferred: download from Azure SAS
+        if download_link:
+            r = requests.get(download_link, stream=True, timeout=60)
+            if r.status_code != 200:
+                return jsonify({
+                    "success": False,
+                    "error": f"Failed to download from Azure (status={r.status_code})"
+                }), 400
+            pdf_bytes = r.content
+
+        # 2) Fallback: OpenAI Files API
+        if pdf_bytes is None and openai_file_id:
+            file_metadata = client.files.retrieve(openai_file_id)
+            if getattr(file_metadata, "filename", None):
+                original_name = file_metadata.filename
+            pdf_bytes = client.files.content(openai_file_id).read()
+
+        # Save temp file
+        safe = secure_filename(original_name) or "uploaded.pdf"
+        if not safe.lower().endswith(".pdf"):
+            safe += ".pdf"
+
+        temp_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{safe}"
+        temp_path = TEMP_UPLOAD_FOLDER / temp_filename
+
+        with open(temp_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        temp_url = f"{request.host_url.rstrip('/')}/temp_files/{temp_filename}"
+
+        return jsonify({
+            "success": True,
+            "temp_filename": temp_filename,
+            "temp_url": temp_url,
+            "expires_in_seconds": 30 * 60
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Temp upload failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 def save_upright_image(in_path: Path, out_path: Path) -> int:
     """
@@ -351,28 +453,77 @@ def process_rfq_id_to_images():
 @app.route("/process-pdf-to-ocr", methods=["POST"])
 def process_pdf_to_ocr():
     if not request.is_json:
-        return jsonify({"success": False, "error": "JSON required. Please provide 'openai_file_id'"}), 400
+        return jsonify({
+            "success": False,
+            "error": "JSON required. Provide 'download_link' OR 'openai_file_id'"
+        }), 400
 
     data = request.get_json()
-    openai_file_id = data.get("openai_file_id")
+    download_link = data.get("download_link")        # preferred (temp link 30 min)
+    openai_file_id = data.get("openai_file_id")      # fallback
     max_pages = int(data.get("max_pages", 20))
 
-    if not openai_file_id:
-        return jsonify({"success": False, "error": "Missing 'openai_file_id'"}), 400
+    if not download_link and not openai_file_id:
+        return jsonify({
+            "success": False,
+            "error": "Missing 'download_link' or 'openai_file_id'"
+        }), 400
 
     timestamp = int(time.time())
-    local_pdf_path = UPLOAD_FOLDER / f"openai_{timestamp}_{openai_file_id}.pdf"
+    local_pdf_path = None
+    original_filename = None
 
     try:
-        file_metadata = client.files.retrieve(openai_file_id)
-        original_filename = file_metadata.filename
-        material_name = extract_material_name_from_filename(original_filename)
+        # -----------------------------
+        # 1) Get PDF bytes
+        # -----------------------------
+        pdf_bytes = None
 
-        content = client.files.content(openai_file_id).read()
+        # A) preferred: direct download link (temp 30 min)
+        if download_link:
+            r = requests.get(download_link, stream=True, timeout=60)
+            if r.status_code != 200:
+                return jsonify({
+                    "success": False,
+                    "error": f"Download link failed (status={r.status_code}). Maybe expired?"
+                }), 400
+            pdf_bytes = r.content
+
+            # optional: try to infer filename from URL path
+            try:
+                p = urllib.parse.urlparse(download_link).path
+                original_filename = Path(p).name or "uploaded.pdf"
+            except Exception:
+                original_filename = "uploaded.pdf"
+
+        # B) fallback: OpenAI Files API
+        if pdf_bytes is None and openai_file_id:
+            file_metadata = client.files.retrieve(openai_file_id)
+            original_filename = getattr(file_metadata, "filename", None) or "uploaded.pdf"
+            pdf_bytes = client.files.content(openai_file_id).read()
+
+        if pdf_bytes is None:
+            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
+
+        # -----------------------------
+        # 2) Save locally (temp 30 min)
+        # -----------------------------
+        safe_name = secure_filename(original_filename or "uploaded.pdf") or "uploaded.pdf"
+        if not safe_name.lower().endswith(".pdf"):
+            safe_name += ".pdf"
+
+        material_name = extract_material_name_from_filename(safe_name)
+
+        unique_pdf_name = f"{uuid.uuid4().hex}_{timestamp}_{safe_name}"
+        local_pdf_path = TEMP_PDF_FOLDER / unique_pdf_name
+
         with open(local_pdf_path, "wb") as f:
-            f.write(content)
+            f.write(pdf_bytes)
 
-        cleanup_old_files(OUTPUT_FOLDER)
+        # -----------------------------
+        # 3) OCR
+        # -----------------------------
+        cleanup_old_files(OUTPUT_FOLDER)  # keeps your existing output images cleanup (24h)
         doc = fitz.open(local_pdf_path)
         total_pages = len(doc)
         mat = fitz.Matrix(2.0, 2.0)
@@ -383,6 +534,7 @@ def process_pdf_to_ocr():
                 break
 
             pix = page.get_pixmap(matrix=mat)
+
             raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
             raw_path = OUTPUT_FOLDER / raw_filename
             pix.save(str(raw_path))
@@ -402,9 +554,11 @@ def process_pdf_to_ocr():
 
         doc.close()
 
+        # keep response compatible
         return jsonify({
             "success": True,
-            "openai_file_id": openai_file_id,
+            "openai_file_id": openai_file_id,              # can be None if using download_link
+            "download_link_used": bool(download_link),
             "material_name": material_name,
             "total_pages": total_pages,
             "converted_pages": len(processed_pages),
@@ -413,13 +567,17 @@ def process_pdf_to_ocr():
         }), 200
 
     except Exception as e:
-        logging.error(f"OpenAI PDF Process Error: {e}", exc_info=True)
+        logging.error(f"PDF Process Error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
     finally:
-        if local_pdf_path and local_pdf_path.exists():
-            with contextlib.suppress(Exception):
-                os.remove(local_pdf_path)
+        # Option 2: keep file up to 30 min (cleanup thread will delete it)
+        # If you want to delete immediately after OCR, uncomment below:
+        # if local_pdf_path and local_pdf_path.exists():
+        #     with contextlib.suppress(Exception):
+        #         os.remove(local_pdf_path)
+        pass
+
 
 @app.route("/save-ocr-result", methods=["POST"])
 def save_ocr_result():
