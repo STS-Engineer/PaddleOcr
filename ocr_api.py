@@ -140,9 +140,10 @@ def extract_material_name_from_filename(filename: str) -> str:
 @app.route("/temp_files/<path:filename>", methods=["GET"])
 def serve_temp_file(filename):
     try:
-        return send_from_directory(str(TEMP_UPLOAD_FOLDER), filename)
+        return send_from_directory(str(TEMP_PDF_FOLDER), filename)
     except Exception:
         return jsonify({"success": False, "error": "temp_file_not_found"}), 404
+
 
 @app.route("/upload-temp-pdf", methods=["POST"])
 def upload_temp_pdf():
@@ -195,7 +196,7 @@ def upload_temp_pdf():
             safe += ".pdf"
 
         temp_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{safe}"
-        temp_path = TEMP_UPLOAD_FOLDER / temp_filename
+        temp_path = TEMP_PDF_FOLDER / temp_filename
 
         with open(temp_path, "wb") as f:
             f.write(pdf_bytes)
