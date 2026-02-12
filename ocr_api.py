@@ -622,56 +622,88 @@ def save_ocr_result():
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
 
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
+
     material_name = data.get("material_name")
     pages = data.get("pages")
     source = data.get("source_type", "datasheet")
+
+    # NEW: reference field (colonne public.matieres.reference)
+    reference = data.get("reference")
 
     if not material_name or not pages:
         return jsonify({"success": False, "error": "Missing material_name or pages"}), 400
 
     type_matiere = data.get("type_matiere") or material_name
+
     specs_json = {
         "material_name": material_name,
         "pages": [{"page": p.get("page"), "ocr_text": p.get("ocr_text", [])} for p in pages]
     }
 
     try:
-        matiere_id, fiche_id = save_material_and_fiche(material_name, type_matiere, specs_json, source)
-        return jsonify({"success": True, "matiere_id": matiere_id, "fiche_id": fiche_id, "source": source}), 200
+        # IMPORTANT: save_material_and_fiche doit être modifiée pour accepter reference
+        matiere_id, fiche_id = save_material_and_fiche(
+            material_name=material_name,
+            type_matiere=type_matiere,
+            specs_json=specs_json,
+            source=source,
+            reference=reference
+        )
+        return jsonify({
+            "success": True,
+            "matiere_id": matiere_id,
+            "fiche_id": fiche_id,
+            "source": source,
+            "reference": reference
+        }), 200
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str):
+def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s", (material_name,))
+                cur.execute(
+                    "SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s",
+                    (material_name,)
+                )
                 row = cur.fetchone()
+
                 if row:
                     matiere_id = row[0]
                     cur.execute(
-                        "UPDATE public.matieres SET type_matiere = %s, date_mise_a_jour = NOW() WHERE matiere_id = %s",
-                        (type_matiere, matiere_id)
+                        """UPDATE public.matieres 
+                           SET type_matiere = %s,
+                               reference = %s,
+                               date_mise_a_jour = NOW()
+                           WHERE matiere_id = %s""",
+                        (type_matiere, reference, matiere_id)
                     )
                 else:
                     cur.execute(
-                        "INSERT INTO public.matieres (nom_matiere, type_matiere, date_creation, date_mise_a_jour) "
-                        "VALUES (%s, %s, NOW(), NOW()) RETURNING matiere_id",
-                        (material_name, type_matiere)
+                        """INSERT INTO public.matieres 
+                           (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
+                           VALUES (%s, %s, %s, NOW(), NOW())
+                           RETURNING matiere_id""",
+                        (material_name, type_matiere, reference)
                     )
                     matiere_id = cur.fetchone()[0]
 
                 cur.execute(
-                    "INSERT INTO public.fiches_matieres (matiere_id, date_creation_fiche, derniere_modification) "
-                    "VALUES (%s, NOW(), NOW()) RETURNING fiche_id",
+                    """INSERT INTO public.fiches_matieres 
+                       (matiere_id, date_creation_fiche, derniere_modification)
+                       VALUES (%s, NOW(), NOW())
+                       RETURNING fiche_id""",
                     (matiere_id,)
                 )
                 fiche_id = cur.fetchone()[0]
 
                 cur.execute(
-                    """INSERT INTO public.specifications (fiche_id, source_type, donnees, date_creation, derniere_modification)
+                    """INSERT INTO public.specifications 
+                       (fiche_id, source_type, donnees, date_creation, derniere_modification)
                        VALUES (%s, %s, %s, NOW(), NOW())""",
                     (fiche_id, source, Json(specs_json))
                 )
