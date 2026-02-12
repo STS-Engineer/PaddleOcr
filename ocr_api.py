@@ -620,36 +620,42 @@ def process_pdf_to_ocr():
 @app.route("/save-ocr-result", methods=["POST"])
 def save_ocr_result():
     if not request.is_json:
-        return jsonify({"success": False, "error": "JSON required"}), 400
+        return jsonify({
+            "success": False,
+            "error": "JSON required"
+        }), 400
 
     data = request.get_json(silent=True) or {}
 
+    # --- Required fields ---
     material_name = data.get("material_name")
-    pages = data.get("pages")
+    specifications = data.get("specifications")  # 🔥 AI structured JSON
     source = data.get("source_type", "datasheet")
-
-    # NEW: reference field (colonne public.matieres.reference)
     reference = data.get("reference")
-
-    if not material_name or not pages:
-        return jsonify({"success": False, "error": "Missing material_name or pages"}), 400
-
     type_matiere = data.get("type_matiere") or material_name
 
-    specs_json = {
-        "material_name": material_name,
-        "pages": [{"page": p.get("page"), "ocr_text": p.get("ocr_text", [])} for p in pages]
-    }
+    # --- Validation ---
+    if not material_name:
+        return jsonify({
+            "success": False,
+            "error": "Missing material_name"
+        }), 400
+
+    if not specifications:
+        return jsonify({
+            "success": False,
+            "error": "Missing specifications JSON"
+        }), 400
 
     try:
-        # IMPORTANT: save_material_and_fiche doit être modifiée pour accepter reference
         matiere_id, fiche_id = save_material_and_fiche(
             material_name=material_name,
             type_matiere=type_matiere,
-            specs_json=specs_json,
+            specs_json=specifications,   # ✅ Direct AI JSON
             source=source,
             reference=reference
         )
+
         return jsonify({
             "success": True,
             "matiere_id": matiere_id,
@@ -659,7 +665,12 @@ def save_ocr_result():
         }), 200
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logging.error(f"Save OCR Result Error: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
 
 def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str):
     conn = psycopg2.connect(DB_DSN)
