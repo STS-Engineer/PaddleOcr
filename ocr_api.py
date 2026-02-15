@@ -137,6 +137,40 @@ def extract_material_name_from_filename(filename: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s or "UNKNOWN"
 
+
+def extract_reference_from_msds_filename(filename: str) -> str:
+    """
+    Extracts reference number from MSDS filenames like:
+    '6600125 - TIMCAL - SDS - English.pdf' -> '6600125'
+    Returns None if pattern doesn't match.
+    """
+    stem = Path(filename).stem
+    # Extract first part before ' - '
+    parts = stem.split(' - ')
+    if parts and parts[0].strip():
+        ref = parts[0].strip()
+        # Verify it looks like a reference (digits)
+        if ref.replace(' ', '').isdigit():
+            return ref
+    return None
+
+
+def extract_reference_from_inspection_filename(filename: str) -> str:
+    """
+    Extracts reference number from Inspection/Control sheet filenames like:
+    '6600125.xls' -> '6600125'
+    '6600125.xlsx' -> '6600125'
+    Returns None if pattern doesn't match.
+    """
+    stem = Path(filename).stem
+    # For inspection sheets, the stem IS the reference
+    ref = stem.strip()
+    # Verify it looks like a reference (digits)
+    if ref.replace(' ', '').isdigit():
+        return ref
+    return None
+
+
 @app.route("/temp_files/<path:filename>", methods=["GET"])
 def serve_temp_file(filename):
     try:
@@ -597,11 +631,18 @@ def process_pdf_to_ocr():
 
         doc.close()
 
+        # Detect if this is an MSDS file and extract reference
+        reference = None
+        if original_filename and ('SDS' in original_filename.upper() or 'MSDS' in original_filename.upper()):
+            reference = extract_reference_from_msds_filename(original_filename)
+            logging.info(f"Detected MSDS file. Extracted reference: {reference}")
+
         return jsonify({
             "success": True,
             "openai_file_id": openai_file_id,
             "download_link_used": bool(download_link),
             "material_name": material_name,
+            "reference": reference,  # NEW: Include extracted reference for MSDS
             "total_pages": total_pages,
             "converted_pages": len(processed_pages),
             "truncated": total_pages > max_pages,
@@ -615,6 +656,89 @@ def process_pdf_to_ocr():
     finally:
         # Temp PDF will be cleaned by background thread after 30 min
         pass
+
+
+@app.route("/save-inspection-sheet", methods=["POST"])
+def save_inspection_sheet():
+    """
+    Endpoint for saving Inspection/Control sheets (Feuilles de contrôle) directly.
+    No OCR processing - accepts structured data directly.
+    
+    Expected JSON:
+    {
+        "filename": "6600125.xls",  // Reference is extracted from filename
+        "specifications": { ... },  // Structured data from Excel parsing
+        "material_name": "Optional material name",
+        "source_type": "certificate" // or "inspection_sheet"
+    }
+    """
+    if not request.is_json:
+        return jsonify({
+            "success": False,
+            "error": "JSON required. Provide 'filename' and 'specifications'"
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+
+    # --- Required fields ---
+    filename = data.get("filename")
+    specifications = data.get("specifications")
+    source = data.get("source_type", "feuille_de_controle_excel_file")  # Default to inspection sheet
+    material_name = data.get("material_name")  # Optional - can be empty
+
+    # --- Validation ---
+    if not filename:
+        return jsonify({
+            "success": False,
+            "error": "Missing 'filename' field"
+        }), 400
+
+    if not specifications:
+        return jsonify({
+            "success": False,
+            "error": "Missing 'specifications' JSON"
+        }), 400
+
+    # Extract reference from filename
+    reference = extract_reference_from_inspection_filename(filename)
+    if not reference:
+        return jsonify({
+            "success": False,
+            "error": f"Could not extract reference from filename: {filename}. Expected format: '6600125.xls'"
+        }), 400
+
+    logging.info(f"Processing inspection sheet - Reference: {reference}, Source: {source}")
+
+    try:
+        # Use reference to find existing material
+        matiere_id, fiche_id, found_material_name = save_inspection_data(
+            reference=reference,
+            specs_json=specifications,
+            source=source,
+            provided_material_name=material_name
+        )
+
+        return jsonify({
+            "success": True,
+            "matiere_id": matiere_id,
+            "fiche_id": fiche_id,
+            "reference": reference,
+            "material_name": found_material_name,
+            "source": source
+        }), 200
+
+    except ValueError as ve:
+        logging.error(f"Validation error: {ve}")
+        return jsonify({
+            "success": False,
+            "error": str(ve)
+        }), 400
+    except Exception as e:
+        logging.error(f"Save Inspection Sheet Error: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 @app.route("/save-ocr-result", methods=["POST"])
@@ -664,6 +788,13 @@ def save_ocr_result():
             "reference": reference
         }), 200
 
+    except ValueError as ve:
+        # Handle specific business logic errors (e.g., material not found)
+        logging.error(f"Validation error: {ve}")
+        return jsonify({
+            "success": False,
+            "error": str(ve)
+        }), 400
     except Exception as e:
         logging.error(f"Save OCR Result Error: {e}", exc_info=True)
         return jsonify({
@@ -672,37 +803,79 @@ def save_ocr_result():
         }), 500
 
 
-def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str):
+def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str = None):
+    """
+    Sauvegarde la matière, crée la fiche technique, 
+    puis insère les données dans la table specifications.
+    
+    If reference is provided (MSDS case), searches for existing material by reference.
+    Otherwise, searches by material_name (datasheet case).
+    """
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s",
-                    (material_name,)
-                )
-                row = cur.fetchone()
-
-                if row:
-                    matiere_id = row[0]
+                matiere_id = None
+                
+                # NEW: Priority search by reference if provided (for MSDS)
+                if reference:
+                    logging.info(f"Searching for material by reference: {reference}")
                     cur.execute(
-                        """UPDATE public.matieres 
-                           SET type_matiere = %s,
-                               reference = %s,
-                               date_mise_a_jour = NOW()
-                           WHERE matiere_id = %s""",
-                        (type_matiere, reference, matiere_id)
+                        "SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s", 
+                        (reference,)
                     )
-                else:
+                    row = cur.fetchone()
+                    if row:
+                        matiere_id = row[0]
+                        existing_name = row[1]
+                        logging.info(f"Found existing material '{existing_name}' (ID: {matiere_id}) with reference {reference}")
+                        # ✅ Material exists - DO NOT update, just use existing matiere_id
+                    else:
+                        # For MSDS, material MUST exist
+                        raise ValueError(
+                            f"Material with reference '{reference}' not found in database. "
+                            f"MSDS can only be added to existing materials. Please ensure the material "
+                            f"datasheet has been processed first."
+                        )
+                
+                # Fallback: Search by material_name (datasheet behavior - only if reference not found)
+                if not matiere_id:
+                    logging.info(f"Searching for material by name: {material_name}")
                     cur.execute(
-                        """INSERT INTO public.matieres 
-                           (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
-                           VALUES (%s, %s, %s, NOW(), NOW())
-                           RETURNING matiere_id""",
-                        (material_name, type_matiere, reference)
+                        "SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s",
+                        (material_name,)
                     )
-                    matiere_id = cur.fetchone()[0]
+                    row = cur.fetchone()
 
+                    if row:
+                        matiere_id = row[0]
+                        logging.info(f"Found existing material by name (ID: {matiere_id})")
+                        # Only update if we have new information to add (reference or type)
+                        if reference or type_matiere:
+                            cur.execute(
+                                """UPDATE public.matieres 
+                                   SET type_matiere = COALESCE(%s, type_matiere),
+                                       reference = COALESCE(%s, reference),
+                                       date_mise_a_jour = NOW()
+                                   WHERE matiere_id = %s""",
+                                (type_matiere, reference, matiere_id)
+                            )
+                            logging.info(f"Updated material {matiere_id} with new info")
+                    else:
+                        # Create NEW material (datasheet case only)
+                        logging.info(f"Creating new material: {material_name}")
+                        cur.execute(
+                            """INSERT INTO public.matieres 
+                               (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
+                               VALUES (%s, %s, %s, NOW(), NOW())
+                               RETURNING matiere_id""",
+                            (material_name, type_matiere, reference)
+                        )
+                        matiere_id = cur.fetchone()[0]
+                        logging.info(f"Created new material with ID: {matiere_id}")
+
+                # 2. Create NEW fiche for the material (supports multiple fiches per material)
+                logging.info(f"Creating new fiche for material {matiere_id} with source_type='{source}'")
                 cur.execute(
                     """INSERT INTO public.fiches_matieres 
                        (matiere_id, date_creation_fiche, derniere_modification)
@@ -711,17 +884,89 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                     (matiere_id,)
                 )
                 fiche_id = cur.fetchone()[0]
+                logging.info(f"Created fiche with ID: {fiche_id}")
 
+                # 3. Insert specifications data
                 cur.execute(
                     """INSERT INTO public.specifications 
                        (fiche_id, source_type, donnees, date_creation, derniere_modification)
                        VALUES (%s, %s, %s, NOW(), NOW())""",
                     (fiche_id, source, Json(specs_json))
                 )
+                logging.info(f"Inserted specifications for fiche {fiche_id}")
 
         return matiere_id, fiche_id
     finally:
         conn.close()
+
+
+def save_inspection_data(reference: str, specs_json: dict, source: str, provided_material_name: str = None):
+    """
+    Saves inspection/control sheet data by finding existing material via reference.
+    Unlike save_material_and_fiche, this ONLY works with existing materials (no creation).
+    
+    Args:
+        reference: Material reference (required)
+        specs_json: Structured specifications data
+        source: Source type (certificate, inspection_sheet, etc.)
+        provided_material_name: Optional material name for logging
+    
+    Returns:
+        (matiere_id, fiche_id, material_name)
+    
+    Raises:
+        ValueError: If material with reference not found
+    """
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # MANDATORY: Find existing material by reference
+                logging.info(f"Searching for material by reference: {reference}")
+                cur.execute(
+                    "SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s",
+                    (reference,)
+                )
+                row = cur.fetchone()
+                
+                if not row:
+                    raise ValueError(
+                        f"Material with reference '{reference}' not found in database. "
+                        f"Inspection sheets can only be added to existing materials. "
+                        f"Please ensure the material datasheet has been processed first."
+                    )
+                
+                matiere_id = row[0]
+                material_name = row[1]
+                logging.info(f"Found existing material '{material_name}' (ID: {matiere_id}) with reference {reference}")
+                
+                # ✅ Material exists - DO NOT modify it, just create new fiche
+                
+                # Create NEW fiche for inspection data
+                logging.info(f"Creating new fiche for material {matiere_id} with source_type='{source}'")
+                cur.execute(
+                    """INSERT INTO public.fiches_matieres 
+                       (matiere_id, date_creation_fiche, derniere_modification)
+                       VALUES (%s, NOW(), NOW())
+                       RETURNING fiche_id""",
+                    (matiere_id,)
+                )
+                fiche_id = cur.fetchone()[0]
+                logging.info(f"Created fiche with ID: {fiche_id}")
+
+                # Insert specifications data
+                cur.execute(
+                    """INSERT INTO public.specifications 
+                       (fiche_id, source_type, donnees, date_creation, derniere_modification)
+                       VALUES (%s, %s, %s, NOW(), NOW())""",
+                    (fiche_id, source, Json(specs_json))
+                )
+                logging.info(f"Inserted {source} specifications for fiche {fiche_id}")
+
+        return matiere_id, fiche_id, material_name
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
     logging.info("Starting RFQ Processing API on port 5000")
