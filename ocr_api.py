@@ -31,6 +31,7 @@ UPLOAD_FOLDER = Path('/tmp/uploads')
 OUTPUT_FOLDER = Path('/tmp/output_images')
 
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
+
 client = OpenAI()
 
 TEMP_PDF_FOLDER = Path('/tmp/temp_pdfs')  # TTL 30 min
@@ -271,6 +272,139 @@ def upload_temp_pdf():
 
     except Exception as e:
         logging.error(f"Temp upload failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/upload-temp-pdf-and-ocr", methods=["POST"])
+def upload_temp_pdf_and_ocr():
+    """
+    Combined endpoint:
+      - Upload/download PDF (same inputs as /upload-temp-pdf)
+      - Save as temp file
+      - Run OCR (same behavior as /process-pdf-to-ocr)
+      - Return temp_url + OCR results
+    """
+    if not request.is_json:
+        return jsonify({
+            "success": False,
+            "error": "JSON required. Provide 'openaiFileIdRefs', 'download_link' OR 'openai_file_id'"
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+
+    refs = data.get("openaiFileIdRefs")
+    download_link = data.get("download_link")
+    openai_file_id = data.get("openai_file_id")
+    max_pages = int(data.get("max_pages", 20))
+    original_name = data.get("filename") or "uploaded.pdf"
+
+    if refs and isinstance(refs, list) and len(refs) > 0:
+        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
+        dl = first_ref.get("download_link")
+        if dl:
+            download_link = dl
+        fid = first_ref.get("id")
+        if fid and not openai_file_id:
+            openai_file_id = fid
+        ref_name = first_ref.get("name")
+        if ref_name:
+            original_name = ref_name
+
+    if not download_link and not openai_file_id:
+        return jsonify({
+            "success": False,
+            "error": "Provide 'openaiFileIdRefs', 'download_link' (Azure SAS) or 'openai_file_id'"
+        }), 400
+
+    timestamp = int(time.time())
+    temp_path = None
+
+    try:
+        pdf_bytes = None
+
+        if download_link:
+            r = requests.get(download_link, stream=True, timeout=60)
+            if r.status_code != 200:
+                return jsonify({
+                    "success": False,
+                    "error": f"Failed to download from link (status={r.status_code}). Maybe expired?"
+                }), 400
+            pdf_bytes = r.content
+
+        if pdf_bytes is None and openai_file_id:
+            file_metadata = client.files.retrieve(openai_file_id)
+            if getattr(file_metadata, "filename", None):
+                original_name = file_metadata.filename
+            pdf_bytes = client.files.content(openai_file_id).read()
+
+        if pdf_bytes is None:
+            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
+
+        safe = secure_filename(original_name) or "uploaded.pdf"
+        if not safe.lower().endswith(".pdf"):
+            safe += ".pdf"
+
+        temp_filename = f"{uuid.uuid4().hex}_{timestamp}_{safe}"
+        temp_path = TEMP_PDF_FOLDER / temp_filename
+        with open(temp_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        temp_url = f"{request.host_url.rstrip('/')}/temp_files/{temp_filename}"
+
+        material_name = extract_material_name_from_filename(safe)
+
+        cleanup_old_files(OUTPUT_FOLDER)
+        doc = fitz.open(temp_path)
+        total_pages = len(doc)
+        mat = fitz.Matrix(2.0, 2.0)
+
+        processed_pages = []
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+
+            pix = page.get_pixmap(matrix=mat)
+
+            raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
+            raw_path = OUTPUT_FOLDER / raw_filename
+            pix.save(str(raw_path))
+
+            upright_filename = f"oa_upright_{i+1}_{timestamp}.png"
+            upright_path = OUTPUT_FOLDER / upright_filename
+            angle = save_upright_image(raw_path, upright_path)
+            raw_path.unlink(missing_ok=True)
+
+            ocr_text_list = run_paddle_ocr_on_file(upright_path)
+
+            processed_pages.append({
+                "page": i + 1,
+                "rotation_angle": angle,
+                "ocr_text": ocr_text_list
+            })
+
+        doc.close()
+
+        reference = None
+        if original_name and ("SDS" in original_name.upper() or "MSDS" in original_name.upper()):
+            reference = extract_reference_from_msds_filename(original_name)
+
+        return jsonify({
+            "success": True,
+            "openai_file_id": openai_file_id,
+            "download_link_used": bool(download_link),
+            "material_name": material_name,
+            "reference": reference,
+            "total_pages": total_pages,
+            "converted_pages": len(processed_pages),
+            "truncated": total_pages > max_pages,
+            "pages": processed_pages,
+            "temp_filename": temp_filename,
+            "temp_url": temp_url,
+            "expires_in_seconds": 30 * 60
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Upload+OCR failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -658,87 +792,7 @@ def process_pdf_to_ocr():
         pass
 
 
-@app.route("/save-inspection-sheet", methods=["POST"])
-def save_inspection_sheet():
-    """
-    Endpoint for saving Inspection/Control sheets (Feuilles de contrôle) directly.
-    No OCR processing - accepts structured data directly.
-    
-    Expected JSON:
-    {
-        "filename": "6600125.xls",  // Reference is extracted from filename
-        "specifications": { ... },  // Structured data from Excel parsing
-        "material_name": "Optional material name",
-        "source_type": "certificate" // or "inspection_sheet"
-    }
-    """
-    if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required. Provide 'filename' and 'specifications'"
-        }), 400
 
-    data = request.get_json(silent=True) or {}
-
-    # --- Required fields ---
-    filename = data.get("filename")
-    specifications = data.get("specifications")
-    source = data.get("source_type", "feuille_de_controle_excel_file")  # Default to inspection sheet
-    material_name = data.get("material_name")  # Optional - can be empty
-
-    # --- Validation ---
-    if not filename:
-        return jsonify({
-            "success": False,
-            "error": "Missing 'filename' field"
-        }), 400
-
-    if not specifications:
-        return jsonify({
-            "success": False,
-            "error": "Missing 'specifications' JSON"
-        }), 400
-
-    # Extract reference from filename
-    reference = extract_reference_from_inspection_filename(filename)
-    if not reference:
-        return jsonify({
-            "success": False,
-            "error": f"Could not extract reference from filename: {filename}. Expected format: '6600125.xls'"
-        }), 400
-
-    logging.info(f"Processing inspection sheet - Reference: {reference}, Source: {source}")
-
-    try:
-        # Use reference to find existing material
-        matiere_id, fiche_id, found_material_name = save_inspection_data(
-            reference=reference,
-            specs_json=specifications,
-            source=source,
-            provided_material_name=material_name
-        )
-
-        return jsonify({
-            "success": True,
-            "matiere_id": matiere_id,
-            "fiche_id": fiche_id,
-            "reference": reference,
-            "material_name": found_material_name,
-            "source": source
-        }), 200
-
-    except ValueError as ve:
-        logging.error(f"Validation error: {ve}")
-        return jsonify({
-            "success": False,
-            "error": str(ve)
-        }), 400
-    except Exception as e:
-        logging.error(f"Save Inspection Sheet Error: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
 
 
 @app.route("/save-ocr-result", methods=["POST"])
@@ -801,6 +855,133 @@ def save_ocr_result():
             "success": False,
             "error": str(e)
         }), 500
+
+
+@app.route("/specifications-by-reference", methods=["GET"])
+def get_specifications_by_reference():
+    reference = request.args.get("reference")
+    if not reference:
+        return jsonify({
+            "success": False,
+            "error": "Missing reference"
+        }), 400
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s.spec_id, s.fiche_id, s.source_type, s.donnees
+                    FROM public.matieres m
+                    JOIN public.fiches_matieres f ON f.matiere_id = m.matiere_id
+                    JOIN public.specifications s ON s.fiche_id = f.fiche_id
+                    WHERE m.reference = %s
+                    ORDER BY s.spec_id ASC
+                    """,
+                    (reference,)
+                )
+                rows = cur.fetchall()
+
+        specs = [
+            {
+                "spec_id": r[0],
+                "fiche_id": r[1],
+                "source_type": r[2],
+                "donnees": r[3]
+            }
+            for r in rows
+        ]
+
+        return jsonify({
+            "success": True,
+            "reference": reference,
+            "specifications": specs
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Get specifications by reference error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/update-specification-by-reference", methods=["PUT"])
+def update_specification_by_reference():
+    if not request.is_json:
+        return jsonify({
+            "success": False,
+            "error": "JSON required"
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+    reference = data.get("reference")
+    spec_id = data.get("spec_id")
+    donnees = data.get("donnees")
+
+    if not spec_id:
+        return jsonify({"success": False, "error": "Missing spec_id"}), 400
+    if donnees is None:
+        return jsonify({"success": False, "error": "Missing donnees"}), 400
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                if reference:
+                    cur.execute(
+                        """
+                        SELECT m.matiere_id, f.fiche_id, s.spec_id
+                        FROM public.matieres m
+                        JOIN public.fiches_matieres f ON f.matiere_id = m.matiere_id
+                        JOIN public.specifications s ON s.fiche_id = f.fiche_id
+                        WHERE m.reference = %s AND s.spec_id = %s
+                        LIMIT 1
+                        """,
+                        (reference, spec_id)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT f.matiere_id, s.fiche_id, s.spec_id
+                        FROM public.specifications s
+                        JOIN public.fiches_matieres f ON f.fiche_id = s.fiche_id
+                        WHERE s.spec_id = %s
+                        LIMIT 1
+                        """,
+                        (spec_id,)
+                    )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({
+                        "success": False,
+                        "error": "Specification not found for spec_id"
+                    }), 404
+
+                matiere_id, fiche_id, spec_id = row
+                cur.execute(
+                    """
+                    UPDATE public.specifications
+                    SET donnees = %s,
+                        derniere_modification = NOW()
+                    WHERE spec_id = %s
+                    """,
+                    (Json(donnees), spec_id)
+                )
+
+        return jsonify({
+            "success": True,
+            "matiere_id": matiere_id,
+            "fiche_id": fiche_id,
+            "spec_id": spec_id,
+            "reference": reference
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Update specification by reference error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
 
 
 def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str = None):
@@ -900,72 +1081,7 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
         conn.close()
 
 
-def save_inspection_data(reference: str, specs_json: dict, source: str, provided_material_name: str = None):
-    """
-    Saves inspection/control sheet data by finding existing material via reference.
-    Unlike save_material_and_fiche, this ONLY works with existing materials (no creation).
-    
-    Args:
-        reference: Material reference (required)
-        specs_json: Structured specifications data
-        source: Source type (certificate, inspection_sheet, etc.)
-        provided_material_name: Optional material name for logging
-    
-    Returns:
-        (matiere_id, fiche_id, material_name)
-    
-    Raises:
-        ValueError: If material with reference not found
-    """
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                # MANDATORY: Find existing material by reference
-                logging.info(f"Searching for material by reference: {reference}")
-                cur.execute(
-                    "SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s",
-                    (reference,)
-                )
-                row = cur.fetchone()
-                
-                if not row:
-                    raise ValueError(
-                        f"Material with reference '{reference}' not found in database. "
-                        f"Inspection sheets can only be added to existing materials. "
-                        f"Please ensure the material datasheet has been processed first."
-                    )
-                
-                matiere_id = row[0]
-                material_name = row[1]
-                logging.info(f"Found existing material '{material_name}' (ID: {matiere_id}) with reference {reference}")
-                
-                # ✅ Material exists - DO NOT modify it, just create new fiche
-                
-                # Create NEW fiche for inspection data
-                logging.info(f"Creating new fiche for material {matiere_id} with source_type='{source}'")
-                cur.execute(
-                    """INSERT INTO public.fiches_matieres 
-                       (matiere_id, date_creation_fiche, derniere_modification)
-                       VALUES (%s, NOW(), NOW())
-                       RETURNING fiche_id""",
-                    (matiere_id,)
-                )
-                fiche_id = cur.fetchone()[0]
-                logging.info(f"Created fiche with ID: {fiche_id}")
 
-                # Insert specifications data
-                cur.execute(
-                    """INSERT INTO public.specifications 
-                       (fiche_id, source_type, donnees, date_creation, derniere_modification)
-                       VALUES (%s, %s, %s, NOW(), NOW())""",
-                    (fiche_id, source, Json(specs_json))
-                )
-                logging.info(f"Inserted {source} specifications for fiche {fiche_id}")
-
-        return matiere_id, fiche_id, material_name
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":
