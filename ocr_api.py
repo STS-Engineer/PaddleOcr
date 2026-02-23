@@ -22,7 +22,6 @@ from paddleocr import PaddleOCR, DocImgOrientationClassification
 import re
 from openai import OpenAI
 from psycopg2.extras import Json
-from groq import Groq
 import json
 
 import uuid
@@ -40,10 +39,6 @@ openai_api_key = (
     os.getenv("OPENAI_API_KEY")
 )
 client = OpenAI(api_key=openai_api_key) if openai_api_key else OpenAI()
-
-# Initialize Groq client
-groq_api_key = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 TEMP_PDF_FOLDER = Path('/tmp/temp_pdfs')  # TTL 30 min
 TEMP_PDF_FOLDER.mkdir(exist_ok=True, parents=True)
@@ -181,186 +176,6 @@ def extract_reference_from_inspection_filename(filename: str) -> str:
     if ref.replace(' ', '').isdigit():
         return ref
     return None
-
-
-# ============== GROQ LLM INTEGRATION ============== #
-
-def build_specifications_prompt(ocr_text: str, material_name: str) -> str:
-    """
-    Build a prompt for Groq LLM to extract and structure specifications from OCR text.
-    """
-    prompt = f"""You are an expert materials engineer assistant. Your task is to extract material specifications from OCR-extracted text and structure them into a JSON object.
-
-## Material Information
-- Material Name: {material_name}
-- OCR Text: {ocr_text}
-
-## Your Task
-
-Extract all relevant specifications from the OCR text and structure them into a JSON object with the following schema:
-
-{{
-  "document_info": {{
-    "document_type": "string (e.g., 'datasheet', 'technical_sheet')",
-    "supplier": "string or null",
-    "date": "string or null"
-  }},
-  "material_identification": {{
-    "material_name": "{material_name}",
-    "chemical_name": "string or null",
-    "cas_number": "string or null",
-    "grade": "string or null"
-  }},
-  "composition": [
-    {{
-      "property": "component name",
-      "value": "percentage or concentration",
-      "unit": "% or ppm",
-      "condition": null,
-      "source_page": 1,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "physical_properties": [
-    {{
-      "property": "density|color|appearance|particle_size|etc",
-      "value": "measured value",
-      "unit": "g/cm³|μm|etc",
-      "condition": "at 20°C or null",
-      "source_page": page_number,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "mechanical_properties": [
-    {{
-      "property": "tensile_strength|hardness|modulus|etc",
-      "value": "numeric value",
-      "unit": "MPa|GPa|etc",
-      "condition": "test conditions or null",
-      "source_page": page_number,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "thermal_properties": [
-    {{
-      "property": "melting_point|thermal_conductivity|expansion|etc",
-      "value": "numeric value",
-      "unit": "°C|W/m·K|etc",
-      "condition": "temperature range or null",
-      "source_page": page_number,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "electrical_properties": [
-    {{
-      "property": "conductivity|resistivity|dielectric_strength|etc",
-      "value": "numeric value",
-      "unit": "S/m|Ω·m|kV/mm|etc",
-      "condition": "frequency or temperature or null",
-      "source_page": page_number,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "chemical_resistance": [
-    {{
-      "property": "resistance_to_acid|alcohol|solvent|etc",
-      "value": "resistant|not_resistant|limited_resistance",
-      "unit": null,
-      "condition": "chemical name",
-      "source_page": page_number,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "standards_and_certifications": [
-    {{
-      "property": "standard_name",
-      "value": "certification_status",
-      "unit": null,
-      "condition": null,
-      "source_page": page_number,
-      "confidence": "high|medium|low"
-    }}
-  ],
-  "processing_and_notes": {{
-    "processing_temperature": "string or null",
-    "special_handling": "string or null",
-    "storage_conditions": "string or null",
-    "notes": "additional important notes or null"
-  }},
-  "raw_excerpts_by_page": {{
-    "1": "exact OCR text from page 1",
-    "2": "exact OCR text from page 2"
-  }}
-}}
-
-## Instructions
-
-1. **Extract accurately**: Only include properties that are explicitly mentioned in the OCR text.
-2. **Confidence levels**: 
-   - "high": Value is clearly stated with units
-   - "medium": Value requires minor interpretation or unit conversion
-   - "low": Value is uncertain, implied, or partially visible
-3. **Units**: Always standardize units to SI. If original unit differs, note in the value.
-4. **Page tracking**: Record which page each property was found on.
-5. **Missing values**: Leave value blank ("") if not found, set confidence to "low", never fabricate data.
-6. **Do not add extra fields** outside the schema above.
-
-## Output
-
-Return ONLY valid JSON object. Do not include markdown, code blocks, or explanations. Start with {{ and end with }}.
-"""
-    return prompt
-
-
-def process_ocr_with_groq(ocr_text: str, material_name: str) -> dict:
-    """
-    Use Groq LLM to extract and structure specifications from OCR text.
-    Returns the parsed SpecificationsJson or an error dict.
-    """
-    if not groq_client:
-        return {
-            "success": False,
-            "error": "Groq API key not configured"
-        }
-
-    try:
-        prompt = build_specifications_prompt(ocr_text, material_name)
-        
-        logging.info("Sending OCR text to Groq LLM for specifications extraction...")
-        message = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=8000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        response_text = message.choices[0].message.content.strip()
-        
-        # Parse JSON response
-        specs_json = json.loads(response_text)
-        
-        logging.info("Successfully extracted specifications via Groq LLM")
-        return {
-            "success": True,
-            "specifications": specs_json
-        }
-
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to parse JSON from Groq response: {e}")
-        return {
-            "success": False,
-            "error": f"Invalid JSON response from LLM: {e}"
-        }
-    except Exception as e:
-        logging.error(f"Error processing with Groq: {e}", exc_info=True)
-        return {
-            "success": False,
-            "error": str(e)
-        }
 
 
 @app.route("/temp_files/<path:filename>", methods=["GET"])
@@ -719,8 +534,6 @@ def process_rfq_id_to_images():
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
         
-        # We query the file path column. We use ILIKE to find rows where 'drawing' 
-        # exists anywhere in that path string.
         query = "SELECT rfq_file_path FROM public.main WHERE rfq_id = %s"
         cur.execute(query, (rfq_id,))
         result = cur.fetchone()
@@ -728,7 +541,6 @@ def process_rfq_id_to_images():
         if not result or not result[0]:
             return jsonify({"success": False, "error": "RFQ ID or File Path not found"}), 404
         
-        # result[0] looks like: "{/path/file1.pdf,/path/Drawing_abc.pdf}"
         raw_paths = result[0].strip("{}").split(",")
         
         # Logic to prioritize the file containing 'drawing'
@@ -836,6 +648,7 @@ def process_rfq_id_to_images():
         if local_pdf_path and local_pdf_path.exists():
             with contextlib.suppress(Exception):
                 os.remove(local_pdf_path)
+
 @app.route("/process-pdf-to-ocr", methods=["POST"])
 def process_pdf_to_ocr():
     if not request.is_json:
@@ -870,12 +683,9 @@ def process_pdf_to_ocr():
     local_pdf_path = None
 
     try:
-        # -----------------------------
-        # 1) Get PDF bytes
-        # -----------------------------
         pdf_bytes = None
 
-        # A) preferred: direct download link (temp 30 min)
+        # A) preferred: direct download link
         if download_link:
             logging.info(f"Downloading from link: {download_link[:100]}...")
             r = requests.get(download_link, stream=True, timeout=60)
@@ -886,9 +696,7 @@ def process_pdf_to_ocr():
                 }), 400
             pdf_bytes = r.content
 
-            # Use original_filename if already set from openaiFileIdRefs
             if not original_filename:
-                # Try to infer filename from URL path
                 try:
                     p = urllib.parse.urlparse(download_link).path
                     original_filename = Path(p).name or "uploaded.pdf"
@@ -905,9 +713,6 @@ def process_pdf_to_ocr():
         if pdf_bytes is None:
             return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
 
-        # -----------------------------
-        # 2) Save locally (temp 30 min)
-        # -----------------------------
         safe_name = secure_filename(original_filename or "uploaded.pdf") or "uploaded.pdf"
         if not safe_name.lower().endswith(".pdf"):
             safe_name += ".pdf"
@@ -922,9 +727,6 @@ def process_pdf_to_ocr():
 
         logging.info(f"PDF saved to: {local_pdf_path}")
 
-        # -----------------------------
-        # 3) OCR
-        # -----------------------------
         cleanup_old_files(OUTPUT_FOLDER)
         doc = fitz.open(local_pdf_path)
         total_pages = len(doc)
@@ -967,7 +769,7 @@ def process_pdf_to_ocr():
             "openai_file_id": openai_file_id,
             "download_link_used": bool(download_link),
             "material_name": material_name,
-            "reference": reference,  # NEW: Include extracted reference for MSDS
+            "reference": reference,
             "total_pages": total_pages,
             "converted_pages": len(processed_pages),
             "truncated": total_pages > max_pages,
@@ -979,11 +781,7 @@ def process_pdf_to_ocr():
         return jsonify({"success": False, "error": str(e)}), 500
 
     finally:
-        # Temp PDF will be cleaned by background thread after 30 min
         pass
-
-
-
 
 
 @app.route("/save-ocr-result", methods=["POST"])
@@ -996,14 +794,12 @@ def save_ocr_result():
 
     data = request.get_json(silent=True) or {}
 
-    # --- Required fields ---
     material_name = data.get("material_name")
-    specifications = data.get("specifications")  # 🔥 AI structured JSON
+    specifications = data.get("specifications")
     source = data.get("source_type", "datasheet")
     reference = data.get("reference")
     type_matiere = data.get("type_matiere") or material_name
 
-    # --- Validation ---
     if not material_name:
         return jsonify({
             "success": False,
@@ -1020,7 +816,7 @@ def save_ocr_result():
         matiere_id, fiche_id = save_material_and_fiche(
             material_name=material_name,
             type_matiere=type_matiere,
-            specs_json=specifications,   # ✅ Direct AI JSON
+            specs_json=specifications,
             source=source,
             reference=reference
         )
@@ -1034,7 +830,6 @@ def save_ocr_result():
         }), 200
 
     except ValueError as ve:
-        # Handle specific business logic errors (e.g., material not found)
         logging.error(f"Validation error: {ve}")
         return jsonify({
             "success": False,
@@ -1189,7 +984,7 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
             with conn.cursor() as cur:
                 matiere_id = None
                 
-                # NEW: Priority search by reference if provided (for MSDS)
+                # Priority search by reference if provided (for MSDS)
                 if reference:
                     logging.info(f"Searching for material by reference: {reference}")
                     cur.execute(
@@ -1201,16 +996,14 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                         matiere_id = row[0]
                         existing_name = row[1]
                         logging.info(f"Found existing material '{existing_name}' (ID: {matiere_id}) with reference {reference}")
-                        # ✅ Material exists - DO NOT update, just use existing matiere_id
                     else:
-                        # For MSDS, material MUST exist
                         raise ValueError(
                             f"Material with reference '{reference}' not found in database. "
                             f"MSDS can only be added to existing materials. Please ensure the material "
                             f"datasheet has been processed first."
                         )
                 
-                # Fallback: Search by material_name (datasheet behavior - only if reference not found)
+                # Fallback: Search by material_name (datasheet behavior)
                 if not matiere_id:
                     logging.info(f"Searching for material by name: {material_name}")
                     cur.execute(
@@ -1222,7 +1015,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                     if row:
                         matiere_id = row[0]
                         logging.info(f"Found existing material by name (ID: {matiere_id})")
-                        # Only update if we have new information to add (reference or type)
                         if reference or type_matiere:
                             cur.execute(
                                 """UPDATE public.matieres 
@@ -1246,7 +1038,7 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                         matiere_id = cur.fetchone()[0]
                         logging.info(f"Created new material with ID: {matiere_id}")
 
-                # 2. Check if fiche already exists for this material + source_type
+                # Check if fiche already exists for this material + source_type
                 logging.info(f"Checking for existing fiche for material {matiere_id} with source_type='{source}'")
                 cur.execute(
                     """SELECT f.fiche_id, s.spec_id 
@@ -1260,7 +1052,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                 existing = cur.fetchone()
                 
                 if existing:
-                    # UPDATE existing specification
                     fiche_id, spec_id = existing
                     logging.info(f"Found existing fiche {fiche_id} and spec {spec_id} - UPDATING donnees")
                     cur.execute(
@@ -1272,7 +1063,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                     )
                     logging.info(f"✅ Updated specifications for fiche {fiche_id}")
                 else:
-                    # CREATE new fiche + specification
                     logging.info(f"No existing fiche found - creating new fiche for material {matiere_id}")
                     cur.execute(
                         """INSERT INTO public.fiches_matieres 
@@ -1284,7 +1074,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                     fiche_id = cur.fetchone()[0]
                     logging.info(f"Created fiche with ID: {fiche_id}")
 
-                    # Insert new specifications
                     cur.execute(
                         """INSERT INTO public.specifications 
                            (fiche_id, source_type, donnees, date_creation, derniere_modification)
@@ -1296,392 +1085,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
         return matiere_id, fiche_id
     finally:
         conn.close()
-
-
-# ============== GROQ-INTEGRATED ENDPOINT ============== #
-
-@app.route("/process-pdf-with-groq", methods=["POST"])
-def process_pdf_with_groq():
-    """
-    Comprehensive endpoint to:
-    1. Upload/download PDF
-    2. Run OCR to extract text
-    3. Use Groq LLM to construct SpecificationsJson
-    4. Save results to database
-    
-    Request JSON:
-    {
-        "openaiFileIdRefs": [...],  // OR
-        "download_link": "url",      // OR  
-        "openai_file_id": "id",
-        "filename": "optional.pdf",
-        "material_name": "optional - uses filename if not provided",
-        "type_matiere": "optional",
-        "source_type": "datasheet|msds|certificate|other (default: datasheet)",
-        "reference": "optional - required for MSDS",
-        "max_pages": 20
-    }
-    
-    Response:
-    {
-        "success": true,
-        "matiere_id": 123,
-        "fiche_id": 456,
-        "reference": "ref123",
-        "source": "datasheet",
-        "ocr_pages": 5,
-        "specifications": {...}
-    }
-    """
-    if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required"
-        }), 400
-
-    data = request.get_json(silent=True) or {}
-    
-    # --- Parse request parameters ---
-    refs = data.get("openaiFileIdRefs")
-    download_link = data.get("download_link")
-    openai_file_id = data.get("openai_file_id")
-    original_name = data.get("filename") or "uploaded.pdf"
-    material_name = data.get("material_name")
-    type_matiere = data.get("type_matiere")
-    source_type = data.get("source_type", "datasheet")
-    reference = data.get("reference")
-    max_pages = data.get("max_pages", 20)
-
-    # --- Validate source_type ---
-    valid_sources = ["datasheet", "msds", "certificate", "feuille_de_controle_excel_file", "other"]
-    if source_type not in valid_sources:
-        return jsonify({
-            "success": False,
-            "error": f"Invalid source_type. Must be one of: {', '.join(valid_sources)}"
-        }), 400
-
-    # --- Handle openaiFileIdRefs ---
-    if refs and isinstance(refs, list) and len(refs) > 0:
-        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
-        dl = first_ref.get("download_link")
-        if dl:
-            download_link = dl
-        fid = first_ref.get("id")
-        if fid and not openai_file_id:
-            openai_file_id = fid
-        ref_name = first_ref.get("name")
-        if ref_name:
-            original_name = ref_name
-
-    if not download_link and not openai_file_id:
-        return jsonify({
-            "success": False,
-            "error": "Provide 'openaiFileIdRefs', 'download_link', or 'openai_file_id'"
-        }), 400
-
-    temp_path = None
-    try:
-        # --- Download PDF ---
-        pdf_bytes = None
-        if download_link:
-            r = requests.get(download_link, stream=True, timeout=60)
-            if r.status_code != 200:
-                return jsonify({
-                    "success": False,
-                    "error": f"Failed to download (status={r.status_code})"
-                }), 400
-            pdf_bytes = r.content
-
-        if pdf_bytes is None and openai_file_id:
-            file_metadata = client.files.retrieve(openai_file_id)
-            if getattr(file_metadata, "filename", None):
-                original_name = file_metadata.filename
-            pdf_bytes = client.files.content(openai_file_id).read()
-
-        if pdf_bytes is None:
-            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
-
-        # --- Save temp PDF ---
-        safe = secure_filename(original_name) or "uploaded.pdf"
-        if not safe.lower().endswith(".pdf"):
-            safe += ".pdf"
-
-        temp_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{safe}"
-        temp_path = TEMP_PDF_FOLDER / temp_filename
-
-        with open(temp_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        # --- Extract material name if not provided ---
-        if not material_name:
-            material_name = extract_material_name_from_filename(safe)
-
-        # --- Run OCR ---
-        logging.info(f"Running OCR on {safe}...")
-        doc = fitz.open(temp_path)
-        total_pages = len(doc)
-        pages_to_process = min(max_pages, total_pages)
-        
-        ocr_text_by_page = {}
-        all_ocr_text = ""
-        
-        for page_num in range(pages_to_process):
-            try:
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-                
-                # Save to temp file for OCR
-                timestamp_unique = int(time.time() * 1000) + page_num  # Unique per page
-                temp_img_path = OUTPUT_FOLDER / f"temp_ocr_json_{page_num}_{timestamp_unique}.png"
-                pix.save(str(temp_img_path))
-                
-                # Use existing OCR function that works
-                ocr_text_list = run_paddle_ocr_on_file(temp_img_path)
-                page_text = "\n".join(ocr_text_list)
-                
-                ocr_text_by_page[str(page_num + 1)] = page_text
-                all_ocr_text += f"\n=== PAGE {page_num + 1} ===\n{page_text}"
-                
-                # Cleanup temp image
-                temp_img_path.unlink(missing_ok=True)
-                
-            except Exception as e:
-                logging.warning(f"OCR failed for page {page_num + 1}: {e}")
-                ocr_text_by_page[str(page_num + 1)] = f"[OCR ERROR: {e}]"
-
-        doc.close()
-        logging.info(f"OCR completed for {pages_to_process} pages")
-
-        # --- Use Groq to construct SpecificationsJson ---
-        groq_result = process_ocr_with_groq(all_ocr_text, material_name)
-        if not groq_result.get("success"):
-            return jsonify({
-                "success": False,
-                "error": f"Groq processing failed: {groq_result.get('error', 'Unknown error')}"
-            }), 500
-
-        specs_json = groq_result.get("specifications", {})
-        
-        # Add raw excerpts
-        if "raw_excerpts_by_page" not in specs_json:
-            specs_json["raw_excerpts_by_page"] = {}
-        specs_json["raw_excerpts_by_page"].update(ocr_text_by_page)
-
-        # --- Validate SpecificationsJson ---
-        if not isinstance(specs_json, dict):
-            return jsonify({
-                "success": False,
-                "error": "Invalid specifications object from LLM"
-            }), 500
-
-        # --- Save to database ---
-        matiere_id, fiche_id = save_material_and_fiche(
-            material_name=material_name,
-            type_matiere=type_matiere or material_name,
-            specs_json=specs_json,
-            source=source_type,
-            reference=reference
-        )
-
-        logging.info(f"✅ Successfully processed PDF: matiere_id={matiere_id}, fiche_id={fiche_id}")
-
-        return jsonify({
-            "success": True,
-            "matiere_id": matiere_id,
-            "fiche_id": fiche_id,
-            "reference": reference,
-            "source": source_type,
-            "material_name": material_name,
-            "ocr_pages": pages_to_process,
-            "total_pages": total_pages,
-            "specifications": specs_json
-        }), 200
-
-    except Exception as e:
-        logging.error(f"Process PDF with Groq error: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-    finally:
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
-
-
-# ============== FORM-DATA ENDPOINT FOR FILE UPLOADS ============== #
-
-@app.route("/process-pdf-with-groq-form", methods=["POST"])
-def process_pdf_with_groq_form():
-    """
-    Form-data version of /process-pdf-with-groq for direct file uploads.
-    Ideal for testing in Apidog or Postman with multipart/form-data.
-    
-    Form Fields:
-    - pdf_file (file): The PDF file to process (required)
-    - material_name (text): Name of material (optional, extracted from filename if omitted)
-    - type_matiere (text): Material type/category (optional)
-    - source_type (text): datasheet|msds|certificate|other (default: datasheet)
-    - reference (text): Material reference code (required for MSDS)
-    - max_pages (number): Max pages to process (default: 20)
-    
-    Returns: JSON with matiere_id, fiche_id, specifications
-    """
-    try:
-        # --- Parse form fields ---
-        material_name = request.form.get("material_name")
-        type_matiere = request.form.get("type_matiere")
-        source_type = request.form.get("source_type", "datasheet")
-        reference = request.form.get("reference")
-        max_pages = request.form.get("max_pages", 20, type=int)
-        
-        # --- Validate source_type ---
-        valid_sources = ["datasheet", "msds", "certificate", "feuille_de_controle_excel_file", "other"]
-        if source_type not in valid_sources:
-            return jsonify({
-                "success": False,
-                "error": f"Invalid source_type. Must be one of: {', '.join(valid_sources)}"
-            }), 400
-        
-        # --- Check for uploaded file ---
-        if "pdf_file" not in request.files:
-            return jsonify({
-                "success": False,
-                "error": "No file uploaded. Provide 'pdf_file' in form-data"
-            }), 400
-        
-        file = request.files["pdf_file"]
-        if file.filename == "":
-            return jsonify({
-                "success": False,
-                "error": "No file selected"
-            }), 400
-        
-        if not file.filename.lower().endswith(".pdf"):
-            return jsonify({
-                "success": False,
-                "error": "Only PDF files are supported"
-            }), 400
-        
-        # --- Read file content ---
-        pdf_bytes = file.read()
-        if not pdf_bytes:
-            return jsonify({
-                "success": False,
-                "error": "File is empty"
-            }), 400
-        
-        # --- Extract material name if not provided ---
-        if not material_name:
-            material_name = extract_material_name_from_filename(file.filename)
-        
-        # --- Save temp PDF ---
-        safe = secure_filename(file.filename) or "uploaded.pdf"
-        temp_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{safe}"
-        temp_path = TEMP_PDF_FOLDER / temp_filename
-        
-        with open(temp_path, "wb") as f:
-            f.write(pdf_bytes)
-        
-        logging.info(f"Form upload: {file.filename} → {temp_filename}")
-        
-        # --- Run OCR ---
-        logging.info(f"Running OCR on {file.filename}...")
-        doc = fitz.open(temp_path)
-        total_pages = len(doc)
-        pages_to_process = min(max_pages, total_pages)
-        
-        ocr_text_by_page = {}
-        all_ocr_text = ""
-        
-        for page_num in range(pages_to_process):
-            try:
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-                
-                # Save to temp file for OCR
-                timestamp_unique = int(time.time() * 1000) + page_num  # Unique per page
-                temp_img_path = OUTPUT_FOLDER / f"temp_ocr_{page_num}_{timestamp_unique}.png"
-                pix.save(str(temp_img_path))
-                
-                # Use existing OCR function that works
-                ocr_text_list = run_paddle_ocr_on_file(temp_img_path)
-                page_text = "\n".join(ocr_text_list)
-                
-                ocr_text_by_page[str(page_num + 1)] = page_text
-                all_ocr_text += f"\n=== PAGE {page_num + 1} ===\n{page_text}"
-                
-                # Cleanup temp image
-                temp_img_path.unlink(missing_ok=True)
-                
-            except Exception as e:
-                logging.warning(f"OCR failed for page {page_num + 1}: {e}")
-                ocr_text_by_page[str(page_num + 1)] = f"[OCR ERROR: {e}]"
-        
-        doc.close()
-        logging.info(f"OCR completed for {pages_to_process} pages")
-        
-        # --- Use Groq to construct SpecificationsJson ---
-        groq_result = process_ocr_with_groq(all_ocr_text, material_name)
-        if not groq_result.get("success"):
-            return jsonify({
-                "success": False,
-                "error": f"Groq processing failed: {groq_result.get('error', 'Unknown error')}"
-            }), 500
-        
-        specs_json = groq_result.get("specifications", {})
-        
-        # Add raw excerpts
-        if "raw_excerpts_by_page" not in specs_json:
-            specs_json["raw_excerpts_by_page"] = {}
-        specs_json["raw_excerpts_by_page"].update(ocr_text_by_page)
-        
-        # --- Validate SpecificationsJson ---
-        if not isinstance(specs_json, dict):
-            return jsonify({
-                "success": False,
-                "error": "Invalid specifications object from LLM"
-            }), 500
-        
-        # --- Save to database ---
-        matiere_id, fiche_id = save_material_and_fiche(
-            material_name=material_name,
-            type_matiere=type_matiere or material_name,
-            specs_json=specs_json,
-            source=source_type,
-            reference=reference
-        )
-        
-        logging.info(f"✅ Form submission processed: matiere_id={matiere_id}, fiche_id={fiche_id}")
-        
-        return jsonify({
-            "success": True,
-            "matiere_id": matiere_id,
-            "fiche_id": fiche_id,
-            "reference": reference,
-            "source": source_type,
-            "material_name": material_name,
-            "ocr_pages": pages_to_process,
-            "total_pages": total_pages,
-            "specifications": specs_json
-        }), 200
-    
-    except Exception as e:
-        logging.error(f"Form processing error: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-    
-    finally:
-        if 'temp_path' in locals() and temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
