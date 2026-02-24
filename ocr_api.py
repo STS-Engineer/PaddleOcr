@@ -903,6 +903,10 @@ def update_specification_by_reference():
     spec_id = data.get("spec_id")
     donnees = data.get("donnees")
 
+    # Safety check: convert string to JSON if needed
+    if isinstance(donnees, str):
+        donnees = json.loads(donnees)
+
     if not spec_id:
         return jsonify({"success": False, "error": "Missing spec_id"}), 400
     if donnees is None:
