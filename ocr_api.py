@@ -5,7 +5,6 @@ import contextlib
 import os
 import urllib.parse
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
 # Flask & Networking
 from werkzeug.utils import secure_filename
@@ -29,7 +28,6 @@ from threading import Thread
 from flask import send_from_directory
 
 # --- CONFIGURATION ---
-load_dotenv()
 
 UPLOAD_FOLDER = Path('/tmp/uploads')
 OUTPUT_FOLDER = Path('/tmp/output_images')
