@@ -1087,7 +1087,319 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
         return matiere_id, fiche_id
     finally:
         conn.close()
+# ==================== BLACK MIX ENDPOINTS ====================
 
+@app.route("/black-mix/validate-material/<reference>", methods=["GET"])
+def validate_black_mix_material(reference):
+    """Validate if a material reference exists in the database"""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT matiere_id, nom_matiere, reference FROM public.matieres WHERE reference = %s",
+                (reference,)
+            )
+            row = cur.fetchone()
+            
+            if row:
+                return jsonify({
+                    "reference": reference,
+                    "exists": True,
+                    "material_name": row[1],
+                    "matiere_id": row[0]
+                }), 200
+            else:
+                return jsonify({
+                    "reference": reference,
+                    "exists": False,
+                    "material_name": None,
+                    "matiere_id": None
+                }), 200
+    except Exception as e:
+        logging.error(f"Validate material error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/submit", methods=["POST"])
+def submit_black_mix():
+    """
+    Submit a complete Black Mix extraction with:
+    - product_reference
+    - mix_name
+    - components (array)
+    - process_steps (array)
+    - control_plan (array)
+    """
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON required"}), 400
+
+    data = request.get_json(silent=True) or {}
+    
+    product_reference = data.get("product_reference")
+    mix_name = data.get("mix_name")
+    components = data.get("components", [])
+    process_steps = data.get("process_steps", [])
+    control_plan = data.get("control_plan", [])
+    source_file = data.get("source_file")
+
+    if not product_reference or not mix_name:
+        return jsonify({
+            "success": False,
+            "error": "Missing required fields: product_reference, mix_name"
+        }), 400
+
+    conn = psycopg2.connect(DB_DSN)
+    
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                validation_errors = []
+                
+                # Validate all material references
+                for component in components:
+                    ref = component.get("reference")
+                    if not ref:
+                        validation_errors.append("Component missing reference")
+                        continue
+                    
+                    cur.execute(
+                        "SELECT matiere_id FROM public.matieres WHERE reference = %s",
+                        (ref,)
+                    )
+                    if not cur.fetchone():
+                        validation_errors.append(f"Invalid material reference: {ref}")
+                
+                if validation_errors:
+                    return jsonify({
+                        "success": False,
+                        "message": "Validation errors",
+                        "validation_errors": validation_errors
+                    }), 400
+                
+                # Create or get product
+                cur.execute(
+                    """SELECT id FROM public.black_mix_products 
+                       WHERE reference_frankfurt = %s""",
+                    (product_reference,)
+                )
+                row = cur.fetchone()
+                
+                if row:
+                    product_id = row[0]
+                else:
+                    cur.execute(
+                        """INSERT INTO public.black_mix_products 
+                           (reference_frankfurt, name, created_at, updated_at)
+                           VALUES (%s, %s, NOW(), NOW())
+                           RETURNING id""",
+                        (product_reference, f"Product {product_reference}")
+                    )
+                    product_id = cur.fetchone()[0]
+                
+                # Create Black Mix
+                cur.execute(
+                    """INSERT INTO public.black_mixes 
+                       (product_id, mix_name, source_file, created_at, updated_at)
+                       VALUES (%s, %s, %s, NOW(), NOW())
+                       RETURNING id""",
+                    (product_id, mix_name, source_file)
+                )
+                black_mix_id = cur.fetchone()[0]
+                
+                # Insert components
+                for component in components:
+                    cur.execute(
+                        "SELECT matiere_id FROM public.matieres WHERE reference = %s",
+                        (component["reference"],)
+                    )
+                    matiere_id = cur.fetchone()[0]
+                    
+                    cur.execute(
+                        """INSERT INTO public.black_mix_components
+                           (black_mix_id, matiere_id, quantity_value, quantity_unit, 
+                            tolerance_min, tolerance_max, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        (black_mix_id, matiere_id, component.get("quantity"),
+                         component.get("unit"), component.get("tolerance_min"),
+                         component.get("tolerance_max"))
+                    )
+                
+                # Insert process steps
+                for step in process_steps:
+                    cur.execute(
+                        """INSERT INTO public.black_mix_process_steps
+                           (black_mix_id, step_order, step_name, machine, parameters, created_at)
+                           VALUES (%s, %s, %s, %s, %s, NOW())""",
+                        (black_mix_id, step.get("step_order"), step.get("step_name"),
+                         step.get("machine"), Json(step.get("parameters", {})))
+                    )
+                
+                # Insert control plan
+                for param in control_plan:
+                    cur.execute(
+                        """INSERT INTO public.black_mix_control_plan
+                           (black_mix_id, parameter_name, target_value, tolerance, unit, created_at)
+                           VALUES (%s, %s, %s, %s, %s, NOW())""",
+                        (black_mix_id, param.get("parameter_name"),
+                         param.get("target_value"), param.get("tolerance"),
+                         param.get("unit"))
+                    )
+                
+                logging.info(f"✅ Created Black Mix {mix_name} (ID: {black_mix_id})")
+                
+                return jsonify({
+                    "success": True,
+                    "message": f"Black Mix {mix_name} created successfully",
+                    "black_mix_id": black_mix_id,
+                    "product_id": product_id,
+                    "validation_errors": []
+                }), 200
+                
+    except Exception as e:
+        logging.error(f"Submit Black Mix error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/list", methods=["GET"])
+def list_black_mixes():
+    """Get all Black Mixes"""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT bm.id, bm.mix_name, bm.created_at, 
+                          bp.reference_frankfurt as product_reference
+                   FROM public.black_mixes bm
+                   JOIN public.black_mix_products bp ON bm.product_id = bp.id
+                   ORDER BY bm.created_at DESC"""
+            )
+            rows = cur.fetchall()
+            
+            black_mixes = [
+                {
+                    "id": r[0],
+                    "mix_name": r[1],
+                    "created_at": r[2].isoformat() if r[2] else None,
+                    "product_reference": r[3]
+                }
+                for r in rows
+            ]
+            
+            return jsonify({
+                "success": True,
+                "black_mixes": black_mixes
+            }), 200
+            
+    except Exception as e:
+        logging.error(f"List Black Mixes error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/<int:mix_id>", methods=["GET"])
+def get_black_mix_details(mix_id):
+    """Get complete details of a Black Mix"""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            # Base info
+            cur.execute(
+                """SELECT bm.id, bm.mix_name, bm.source_file, bm.created_at,
+                          bp.reference_frankfurt, bp.name as product_name
+                   FROM public.black_mixes bm
+                   JOIN public.black_mix_products bp ON bm.product_id = bp.id
+                   WHERE bm.id = %s""",
+                (mix_id,)
+            )
+            row = cur.fetchone()
+            
+            if not row:
+                return jsonify({"success": False, "error": "Black Mix not found"}), 404
+            
+            result = {
+                "id": row[0],
+                "mix_name": row[1],
+                "source_file": row[2],
+                "created_at": row[3].isoformat() if row[3] else None,
+                "product_reference": row[4],
+                "product_name": row[5]
+            }
+            
+            # Components
+            cur.execute(
+                """SELECT c.*, m.reference, m.nom_matiere
+                   FROM public.black_mix_components c
+                   JOIN public.matieres m ON c.matiere_id = m.matiere_id
+                   WHERE c.black_mix_id = %s""",
+                (mix_id,)
+            )
+            result["components"] = [
+                {
+                    "reference": r[7],
+                    "material_name": r[8],
+                    "quantity": float(r[3]) if r[3] else None,
+                    "unit": r[4],
+                    "tolerance_min": float(r[5]) if r[5] else None,
+                    "tolerance_max": float(r[6]) if r[6] else None
+                }
+                for r in cur.fetchall()
+            ]
+            
+            # Process steps
+            cur.execute(
+                """SELECT step_order, step_name, machine, parameters
+                   FROM public.black_mix_process_steps
+                   WHERE black_mix_id = %s
+                   ORDER BY step_order""",
+                (mix_id,)
+            )
+            result["process_steps"] = [
+                {
+                    "step_order": r[0],
+                    "step_name": r[1],
+                    "machine": r[2],
+                    "parameters": r[3]
+                }
+                for r in cur.fetchall()
+            ]
+            
+            # Control plan
+            cur.execute(
+                """SELECT parameter_name, target_value, tolerance, unit
+                   FROM public.black_mix_control_plan
+                   WHERE black_mix_id = %s""",
+                (mix_id,)
+            )
+            result["control_plan"] = [
+                {
+                    "parameter_name": r[0],
+                    "target_value": r[1],
+                    "tolerance": r[2],
+                    "unit": r[3]
+                }
+                for r in cur.fetchall()
+            ]
+            
+            return jsonify({
+                "success": True,
+                "black_mix": result
+            }), 200
+            
+    except Exception as e:
+        logging.error(f"Get Black Mix details error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+        
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Simple health check endpoint."""
+    return jsonify({"status": "ok", "service": "ocr_api"}), 200
 
 if __name__ == "__main__":
     logging.info("Starting RFQ Processing API on port 5000")
