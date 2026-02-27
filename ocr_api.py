@@ -647,6 +647,171 @@ def process_rfq_id_to_images():
             with contextlib.suppress(Exception):
                 os.remove(local_pdf_path)
 
+
+
+@app.route("/process-openai-file-to-ocr", methods=["POST"])
+def process_openai_file_to_ocr():
+    """
+    1. Receives OpenAI File ID or download link.
+    2. Retrieves the PDF.
+    3. Converts to high-res images (no rotation).
+    4. Runs OCR and returns image display URLs + text.
+    """
+    if not request.is_json:
+        return jsonify({
+            "success": False,
+            "error": "JSON required. Provide 'openaiFileIdRefs', 'download_link' OR 'openai_file_id'"
+        }), 400
+
+    data = request.get_json()
+    
+    # Handle openaiFileIdRefs array (Claude's format)
+    openai_file_id_refs = data.get("openaiFileIdRefs")
+    download_link = data.get("download_link")
+    openai_file_id = data.get("openai_file_id")
+    max_pages = int(data.get("max_pages", 20))
+    original_filename = None
+
+    # Extract from openaiFileIdRefs if present (priority #1)
+    if openai_file_id_refs and isinstance(openai_file_id_refs, list) and len(openai_file_id_refs) > 0:
+        first_ref = openai_file_id_refs[0]
+        download_link = first_ref.get("download_link")
+        original_filename = first_ref.get("name", "uploaded.pdf")
+        logging.info(f"Using openaiFileIdRefs: {original_filename}")
+
+    if not download_link and not openai_file_id:
+        return jsonify({
+            "success": False,
+            "error": "Missing 'openaiFileIdRefs', 'download_link' or 'openai_file_id'"
+        }), 400
+
+    timestamp = int(time.time())
+    local_pdf_path = None
+    download_url_page_1 = None
+
+    try:
+        pdf_bytes = None
+
+        # A) preferred: direct download link
+        if download_link:
+            logging.info(f"Downloading from link: {download_link[:100]}...")
+            r = requests.get(download_link, stream=True, timeout=60)
+            if r.status_code != 200:
+                return jsonify({
+                    "success": False,
+                    "error": f"Download link failed (status={r.status_code}). Maybe expired?"
+                }), 400
+            pdf_bytes = r.content
+
+            if not original_filename:
+                try:
+                    p = urllib.parse.urlparse(download_link).path
+                    original_filename = Path(p).name or "uploaded.pdf"
+                except Exception:
+                    original_filename = "uploaded.pdf"
+
+        # B) fallback: OpenAI Files API
+        if pdf_bytes is None and openai_file_id:
+            logging.info(f"Using OpenAI file ID: {openai_file_id}")
+            file_metadata = client.files.retrieve(openai_file_id)
+            original_filename = getattr(file_metadata, "filename", None) or "uploaded.pdf"
+            pdf_bytes = client.files.content(openai_file_id).read()
+
+        if pdf_bytes is None:
+            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
+
+        safe_name = secure_filename(original_filename or "uploaded.pdf") or "uploaded.pdf"
+        if not safe_name.lower().endswith(".pdf"):
+            safe_name += ".pdf"
+
+        # Assuming these helper functions are defined elsewhere in your code
+        material_name = extract_material_name_from_filename(safe_name)
+
+        unique_pdf_name = f"{uuid.uuid4().hex}_{timestamp}_{safe_name}"
+        local_pdf_path = TEMP_PDF_FOLDER / unique_pdf_name
+
+        with open(local_pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        logging.info(f"PDF saved to: {local_pdf_path}")
+
+        cleanup_old_files(OUTPUT_FOLDER)
+        doc = fitz.open(local_pdf_path)
+        total_pages = len(doc)
+        mat = fitz.Matrix(2.0, 2.0)
+        
+        base_url = request.host_url.rstrip('/')
+        processed_pages = []
+
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+
+            pix = page.get_pixmap(matrix=mat)
+
+            # Save direct render (no rotation)
+            filename = f"oa_page_{i+1}_{timestamp}.png"
+            image_path = OUTPUT_FOLDER / filename
+            pix.save(str(image_path))
+
+            # Run OCR directly on the newly saved image
+            ocr_text_list = run_paddle_ocr_on_file(image_path)
+            
+            # Prepare Response URLs
+            view_url = f"{base_url}/images/{filename}"
+            dl_url   = f"{base_url}/download-image/{filename}"
+
+            processed_pages.append({
+                "page": i + 1,
+                "url": view_url,  # Display link added here
+                "download_link_image": dl_url,
+                "filename": filename,
+                "ocr_text": ocr_text_list
+            })
+            
+            if i == 0:
+                download_url_page_1 = dl_url
+
+        doc.close()
+
+        # Detect if this is an MSDS file and extract reference
+        reference = None
+        if original_filename and ('SDS' in original_filename.upper() or 'MSDS' in original_filename.upper()):
+            reference = extract_reference_from_msds_filename(original_filename)
+            logging.info(f"Detected MSDS file. Extracted reference: {reference}")
+
+        return jsonify({
+            "success": True,
+            "openai_file_id": openai_file_id,
+            "download_link_used": bool(download_link),
+            "material_name": material_name,
+            "reference": reference,
+            "total_pages": total_pages,
+            "converted_pages": len(processed_pages),
+            "truncated": total_pages > max_pages,
+            "download_url_page_1_png": download_url_page_1,
+            "pages": processed_pages
+        }), 200
+
+    except Exception as e:
+        logging.error(f"PDF Process Error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    finally:
+        # Clean up the temporary PDF file to save disk space
+        if local_pdf_path and Path(local_pdf_path).exists():
+            with contextlib.suppress(Exception):
+                os.remove(local_pdf_path)
+
+
+
+
+
+
+
+
+
+
 @app.route("/process-pdf-to-ocr", methods=["POST"])
 def process_pdf_to_ocr():
     if not request.is_json:
