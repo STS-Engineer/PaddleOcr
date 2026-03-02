@@ -1147,75 +1147,64 @@ def update_specification_by_reference():
 
 
 def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str = None):
-    """
-    Sauvegarde la matière, crée la fiche technique, 
-    puis insère les données dans la table specifications.
-    
-    If reference is provided (MSDS case), searches for existing material by reference.
-    Otherwise, searches by material_name (datasheet case).
-    """
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
             with conn.cursor() as cur:
                 matiere_id = None
-                
-                # Priority search by reference if provided (for MSDS)
-                if reference:
-                    logging.info(f"Searching for material by reference: {reference}")
-                    cur.execute(
-                        "SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s", 
-                        (reference,)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        matiere_id = row[0]
-                        existing_name = row[1]
-                        logging.info(f"Found existing material '{existing_name}' (ID: {matiere_id}) with reference {reference}")
-                    else:
-                        raise ValueError(
-                            f"Material with reference '{reference}' not found in database. "
-                            f"MSDS can only be added to existing materials. Please ensure the material "
-                            f"datasheet has been processed first."
-                        )
-                
-                # Fallback: Search by material_name (datasheet behavior)
-                if not matiere_id:
-                    logging.info(f"Searching for material by name: {material_name}")
+
+                # 1. Search by name
+                if material_name:
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s",
                         (material_name,)
                     )
                     row = cur.fetchone()
-
                     if row:
                         matiere_id = row[0]
-                        logging.info(f"Found existing material by name (ID: {matiere_id})")
-                        if reference or type_matiere:
-                            cur.execute(
-                                """UPDATE public.matieres 
-                                   SET type_matiere = COALESCE(%s, type_matiere),
-                                       reference = COALESCE(%s, reference),
-                                       date_mise_a_jour = NOW()
-                                   WHERE matiere_id = %s""",
-                                (type_matiere, reference, matiere_id)
-                            )
-                            logging.info(f"Updated material {matiere_id} with new info")
-                    else:
-                        # Create NEW material (datasheet case only)
-                        logging.info(f"Creating new material: {material_name}")
+                        logging.info(f"Found by name (ID: {matiere_id}) → updating")
                         cur.execute(
-                            """INSERT INTO public.matieres 
-                               (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
-                               VALUES (%s, %s, %s, NOW(), NOW())
-                               RETURNING matiere_id""",
-                            (material_name, type_matiere, reference)
+                            """UPDATE public.matieres 
+                               SET type_matiere = COALESCE(%s, type_matiere),
+                                   reference = COALESCE(%s, reference),
+                                   date_mise_a_jour = NOW()
+                               WHERE matiere_id = %s""",
+                            (type_matiere, reference, matiere_id)
                         )
-                        matiere_id = cur.fetchone()[0]
-                        logging.info(f"Created new material with ID: {matiere_id}")
 
-                # Check if fiche already exists for this material + source_type
-                logging.info(f"Checking for existing fiche for material {matiere_id} with source_type='{source}'")
+                # 2. Search by reference if not found by name
+                if not matiere_id and reference:
+                    cur.execute(
+                        "SELECT matiere_id FROM public.matieres WHERE reference = %s",
+                        (reference,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        matiere_id = row[0]
+                        logging.info(f"Found by reference (ID: {matiere_id}) → updating")
+                        cur.execute(
+                            """UPDATE public.matieres 
+                               SET nom_matiere = COALESCE(%s, nom_matiere),
+                                   type_matiere = COALESCE(%s, type_matiere),
+                                   date_mise_a_jour = NOW()
+                               WHERE matiere_id = %s""",
+                            (material_name, type_matiere, matiere_id)
+                        )
+
+                # 3. Not found anywhere → CREATE new material with all info
+                if not matiere_id:
+                    logging.info(f"Not found → Creating new material: {material_name} ref={reference}")
+                    cur.execute(
+                        """INSERT INTO public.matieres 
+                           (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
+                           VALUES (%s, %s, %s, NOW(), NOW())
+                           RETURNING matiere_id""",
+                        (material_name, type_matiere, reference)
+                    )
+                    matiere_id = cur.fetchone()[0]
+                    logging.info(f"Created new material with ID: {matiere_id}")
+
+                # 4. Check if fiche + spec already exists
                 cur.execute(
                     """SELECT f.fiche_id, s.spec_id 
                        FROM public.fiches_matieres f
@@ -1226,10 +1215,10 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                     (matiere_id, source)
                 )
                 existing = cur.fetchone()
-                
+
                 if existing:
                     fiche_id, spec_id = existing
-                    logging.info(f"Found existing fiche {fiche_id} and spec {spec_id} - UPDATING donnees")
+                    logging.info(f"Updating existing spec {spec_id}")
                     cur.execute(
                         """UPDATE public.specifications 
                            SET donnees = %s,
@@ -1237,9 +1226,7 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                            WHERE spec_id = %s""",
                         (Json(specs_json), spec_id)
                     )
-                    logging.info(f"✅ Updated specifications for fiche {fiche_id}")
                 else:
-                    logging.info(f"No existing fiche found - creating new fiche for material {matiere_id}")
                     cur.execute(
                         """INSERT INTO public.fiches_matieres 
                            (matiere_id, date_creation_fiche, derniere_modification)
@@ -1256,11 +1243,12 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                            VALUES (%s, %s, %s, NOW(), NOW())""",
                         (fiche_id, source, Json(specs_json))
                     )
-                    logging.info(f"✅ Inserted new specifications for fiche {fiche_id}")
+                    logging.info(f"Inserted specifications for fiche {fiche_id}")
 
         return matiere_id, fiche_id
     finally:
         conn.close()
+
 # ==================== BLACK MIX ENDPOINTS ====================
 
 @app.route("/black-mix/validate-material/<reference>", methods=["GET"])
