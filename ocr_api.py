@@ -371,7 +371,7 @@ def upload_temp_pdf_and_ocr():
 
             raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
             raw_path = OUTPUT_FOLDER / raw_filename
-            pix.(str(raw_path))
+            pix.save(str(raw_path))
 
             upright_filename = f"oa_upright_{i+1}_{timestamp}.png"
             upright_path = OUTPUT_FOLDER / upright_filename
