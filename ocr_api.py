@@ -1257,20 +1257,46 @@ def submit_black_mix():
                         )
                     )
 
-                # --- Insert process steps ---
+                # --- Insert process steps + step-materials ---
                 for step in process_steps:
+
+                    # Insert step and get its ID
                     cur.execute(
                         """INSERT INTO public.black_mix_process_steps
                            (black_mix_id, step_order, step_name, machine_name, parameters)
-                           VALUES (%s, %s, %s, %s, %s)""",
+                           VALUES (%s, %s, %s, %s, %s)
+                           RETURNING id""",
                         (
                             black_mix_id,
                             step.get("step_order"),
                             step.get("step_name"),
-                            step.get("machine"),          # mapped from AI field "machine"
+                            step.get("machine"),
                             Json(step.get("parameters", {}))
                         )
                     )
+
+                    process_step_id = cur.fetchone()[0]
+
+                    # Insert step-materials mapping
+                    materials = step.get("materials", [])
+                    for ref in materials:
+                        cur.execute(
+                            "SELECT matiere_id FROM public.matieres WHERE reference = %s",
+                            (ref,)
+                        )
+                        mat_row = cur.fetchone()
+                        if not mat_row:
+                            raise ValueError(f"Invalid material reference in step: {ref}")
+
+                        matiere_id = mat_row[0]
+
+                        cur.execute(
+                            """INSERT INTO public.black_mix_step_materials
+                               (process_step_id, matiere_id)
+                               VALUES (%s, %s)
+                               ON CONFLICT DO NOTHING""",
+                            (process_step_id, matiere_id)
+                        )
 
                 # --- Insert control plan ---
                 for param in control_plan:
@@ -1389,20 +1415,29 @@ def get_black_mix_details(mix_id):
                 for r in cur.fetchall()
             ]
 
-            # --- Process steps ---
+            # --- Process steps with materials ---
             cur.execute(
-                """SELECT step_order, step_name, machine_name, parameters
-                   FROM public.black_mix_process_steps
-                   WHERE black_mix_id = %s
-                   ORDER BY step_order""",
+                """
+                SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
+                       ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
+                FROM public.black_mix_process_steps s
+                LEFT JOIN public.black_mix_step_materials sm
+                    ON sm.process_step_id = s.id
+                LEFT JOIN public.matieres m
+                    ON m.matiere_id = sm.matiere_id
+                WHERE s.black_mix_id = %s
+                GROUP BY s.id, s.step_order, s.step_name, s.machine_name, s.parameters
+                ORDER BY s.step_order
+                """,
                 (mix_id,)
             )
             result["process_steps"] = [
                 {
-                    "step_order": r[0],
-                    "step_name": r[1],
-                    "machine": r[2],
-                    "parameters": r[3]
+                    "step_order": r[1],
+                    "step_name": r[2],
+                    "machine": r[3],
+                    "parameters": r[4],
+                    "materials": list(r[5]) if r[5] and r[5][0] is not None else []
                 }
                 for r in cur.fetchall()
             ]
