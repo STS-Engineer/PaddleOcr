@@ -77,7 +77,6 @@ def init_models():
     
     try:
         logging.info("Loading PaddleOCR (lang=ch)...")
-        # Main OCR Engine
         paddle_engine = PaddleOCR(
             lang="ch",
             use_doc_orientation_classify=True, 
@@ -85,14 +84,12 @@ def init_models():
             use_textline_orientation=True     
         )
         
-        # Orientation Classification Model
         doc_ori = DocImgOrientationClassification(model_name="PP-LCNet_x1_0_doc_ori")
         
         logging.info("Models initialized successfully.")
     except Exception as e:
         logging.error(f"FATAL: Failed to load models: {e}")
 
-# Pre-load models
 init_models()
 
 # ----------------- HELPER FUNCTIONS ----------------- #
@@ -107,7 +104,7 @@ def cleanup_old_files(folder, max_age_hours=24):
                 if file_time < cutoff_time:
                     os.remove(file_path)
     except Exception:
-        pass # Silent fail is fine for cleanup
+        pass
 
 
 def cleanup_temp_pdfs(interval_seconds=300, max_age_seconds=30 * 60):
@@ -144,33 +141,18 @@ def extract_material_name_from_filename(filename: str) -> str:
 
 
 def extract_reference_from_msds_filename(filename: str) -> str:
-    """
-    Extracts reference number from MSDS filenames like:
-    '6600125 - TIMCAL - SDS - English.pdf' -> '6600125'
-    Returns None if pattern doesn't match.
-    """
     stem = Path(filename).stem
-    # Extract first part before ' - '
     parts = stem.split(' - ')
     if parts and parts[0].strip():
         ref = parts[0].strip()
-        # Verify it looks like a reference (digits)
         if ref.replace(' ', '').isdigit():
             return ref
     return None
 
 
 def extract_reference_from_inspection_filename(filename: str) -> str:
-    """
-    Extracts reference number from Inspection/Control sheet filenames like:
-    '6600125.xls' -> '6600125'
-    '6600125.xlsx' -> '6600125'
-    Returns None if pattern doesn't match.
-    """
     stem = Path(filename).stem
-    # For inspection sheets, the stem IS the reference
     ref = stem.strip()
-    # Verify it looks like a reference (digits)
     if ref.replace(' ', '').isdigit():
         return ref
     return None
@@ -186,41 +168,24 @@ def serve_temp_file(filename):
 
 @app.route("/upload-temp-pdf", methods=["POST"])
 def upload_temp_pdf():
-    """
-    JSON accepté (ordre de priorité):
-      1) openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ]
-      2) download_link: Azure SAS URL (preferred)
-      3) openai_file_id: fallback OpenAI Files API
-
-    Returns:
-      - temp_filename + temp_url (valid until cleanup ~30 min)
-    """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
 
-    # --- NEW: accept openaiFileIdRefs ---
     refs = data.get("openaiFileIdRefs")
     download_link = data.get("download_link")
     openai_file_id = data.get("openai_file_id")
     original_name = data.get("filename") or "uploaded.pdf"
 
-    # If openaiFileIdRefs is provided, it has priority
     if refs and isinstance(refs, list) and len(refs) > 0:
         first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
-
-        # Prefer download_link if present
         dl = first_ref.get("download_link")
         if dl:
             download_link = dl
-
-        # Keep file id as fallback
         fid = first_ref.get("id")
         if fid and not openai_file_id:
             openai_file_id = fid
-
-        # Try to use original filename
         ref_name = first_ref.get("name")
         if ref_name:
             original_name = ref_name
@@ -234,7 +199,6 @@ def upload_temp_pdf():
     try:
         pdf_bytes = None
 
-        # 1) Preferred: download from link (Azure SAS OR Actions temp link)
         if download_link:
             r = requests.get(download_link, stream=True, timeout=60)
             if r.status_code != 200:
@@ -244,7 +208,6 @@ def upload_temp_pdf():
                 }), 400
             pdf_bytes = r.content
 
-        # 2) Fallback: OpenAI Files API
         if pdf_bytes is None and openai_file_id:
             file_metadata = client.files.retrieve(openai_file_id)
             if getattr(file_metadata, "filename", None):
@@ -254,7 +217,6 @@ def upload_temp_pdf():
         if pdf_bytes is None:
             return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
 
-        #  temp file
         safe = secure_filename(original_name) or "uploaded.pdf"
         if not safe.lower().endswith(".pdf"):
             safe += ".pdf"
@@ -281,13 +243,6 @@ def upload_temp_pdf():
 
 @app.route("/upload-temp-pdf-and-ocr", methods=["POST"])
 def upload_temp_pdf_and_ocr():
-    """
-    Combined endpoint:
-      - Upload/download PDF (same inputs as /upload-temp-pdf)
-      -  as temp file
-      - Run OCR (same behavior as /process-pdf-to-ocr)
-      - Return temp_url + OCR results
-    """
     if not request.is_json:
         return jsonify({
             "success": False,
@@ -413,10 +368,6 @@ def upload_temp_pdf_and_ocr():
 
 
 def save_upright_image(in_path: Path, out_path: Path) -> int:
-    """
-    Predicts orientation, rotates the image using OpenCV, and saves it.
-    Returns the rotation angle applied (0, 90, 180, 270).
-    """
     if doc_ori is None:
         return -1
 
@@ -432,7 +383,6 @@ def save_upright_image(in_path: Path, out_path: Path) -> int:
     if img is None:
         return -1
 
-    # Rotate manually based on prediction
     if angle == 90:
         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     elif angle == 180:
@@ -442,6 +392,7 @@ def save_upright_image(in_path: Path, out_path: Path) -> int:
     
     cv2.imwrite(str(out_path), img)
     return angle
+
 
 def run_paddle_ocr_on_file(img_path: Path):
     """Runs PaddleOCR on a specific image file."""
@@ -486,33 +437,27 @@ def run_paddle_ocr_on_file(img_path: Path):
         logging.exception(f"PaddleOCR failed on {img_path}")
         return []
 
+
 # ----------------- ENDPOINTS ----------------- #
 
 @app.route('/images/<filename>', methods=['GET'])
 def serve_image(filename):
-    """Required to view the images returned by the process route."""
     try:
         return send_file(str(OUTPUT_FOLDER / secure_filename(filename)), mimetype='image/jpeg')
     except Exception:
         return jsonify({"success": False, "error": "Image not found"}), 404
 
+
 @app.route('/download-image/<filename>', methods=['GET'])
 def download_image(filename):
-    """Required to download the images returned by the process route."""
     try:
         return send_file(str(OUTPUT_FOLDER / secure_filename(filename)), as_attachment=True)
     except Exception:
         return jsonify({"success": False, "error": "Image not found"}), 404
 
+
 @app.route('/process-rfq-id-to-images', methods=['POST'])
 def process_rfq_id_to_images():
-    """
-    Main Route:
-    1. Fetches PDF path from DB using RFQ_ID.
-    2. Downloads PDF from GitHub.
-    3. Converts to Images -> Rotates Upright -> Runs OCR.
-    4. Returns JSON with image URLs and Extracted Text.
-    """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
 
@@ -521,13 +466,12 @@ def process_rfq_id_to_images():
     if not rfq_id:
         return jsonify({"success": False, "error": "Missing 'rfq_id'"}), 400
 
-    mat = fitz.Matrix(2.0, 2.0) # High-res zoom
+    mat = fitz.Matrix(2.0, 2.0)
     local_pdf_path = None
     conn = None
     download_url_page_1 = None
 
     try:
-        # 1. DB Fetch & Search for Drawing
         logging.info(f"Fetching RFQ and searching for drawing: {rfq_id}")
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
@@ -541,20 +485,17 @@ def process_rfq_id_to_images():
         
         raw_paths = result[0].strip("{}").split(",")
         
-        # Logic to prioritize the file containing 'drawing'
         rfq_path_db = None
         for path in raw_paths:
             if 'drawing' in path.lower():
                 rfq_path_db = path.strip()
                 break
         
-        # Fallback to the first file if no 'drawing' is found
         if not rfq_path_db and raw_paths:
             rfq_path_db = raw_paths[0].strip()
         
         logging.info(f"Target file identified: {rfq_path_db}")
         
-        # 2. GitHub Download
         clean_path = rfq_path_db.strip("/")
         encoded_path = urllib.parse.quote(clean_path)
         url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{encoded_path}"
@@ -570,7 +511,6 @@ def process_rfq_id_to_images():
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
                 
-        # 3. Process Pages
         cleanup_old_files(OUTPUT_FOLDER)
         doc = fitz.open(local_pdf_path)
         total_pages = len(doc)
@@ -586,24 +526,19 @@ def process_rfq_id_to_images():
 
             pix = page.get_pixmap(matrix=mat)
 
-            # Save initial raw render
             raw_filename = f"{rfq_id}_page_{i+1}_{timestamp}.png"
             raw_path = OUTPUT_FOLDER / raw_filename
             pix.save(str(raw_path))
 
-            # Correct Orientation (Save as new file)
             upright_filename = f"{rfq_id}_page_{i+1}_{timestamp}_upright.png"
             upright_path = OUTPUT_FOLDER / upright_filename
             angle = save_upright_image(raw_path, upright_path)
 
-            # Cleanup raw immediately
             raw_path.unlink(missing_ok=True)
 
-            # OCR on the upright image
             logging.info(f"Running OCR on page {i+1} (angle={angle})...")
             ocr_text_list = run_paddle_ocr_on_file(upright_path)
 
-            # Prepare Response URLs
             view_url = f"{base_url}/images/{upright_filename}"
             dl_url   = f"{base_url}/download-image/{upright_filename}"
 
@@ -648,15 +583,8 @@ def process_rfq_id_to_images():
                 os.remove(local_pdf_path)
 
 
-
 @app.route("/process-openai-file-to-ocr", methods=["POST"])
 def process_openai_file_to_ocr():
-    """
-    1. Receives OpenAI File ID or download link.
-    2. Retrieves the PDF.
-    3. Converts to high-res images (no rotation).
-    4. Runs OCR and returns image display URLs + text.
-    """
     if not request.is_json:
         return jsonify({
             "success": False,
@@ -665,14 +593,12 @@ def process_openai_file_to_ocr():
 
     data = request.get_json()
     
-    # Handle openaiFileIdRefs array (Claude's format)
     openai_file_id_refs = data.get("openaiFileIdRefs")
     download_link = data.get("download_link")
     openai_file_id = data.get("openai_file_id")
     max_pages = int(data.get("max_pages", 20))
     original_filename = None
 
-    # Extract from openaiFileIdRefs if present (priority #1)
     if openai_file_id_refs and isinstance(openai_file_id_refs, list) and len(openai_file_id_refs) > 0:
         first_ref = openai_file_id_refs[0]
         download_link = first_ref.get("download_link")
@@ -692,7 +618,6 @@ def process_openai_file_to_ocr():
     try:
         pdf_bytes = None
 
-        # A) preferred: direct download link
         if download_link:
             logging.info(f"Downloading from link: {download_link[:100]}...")
             r = requests.get(download_link, stream=True, timeout=60)
@@ -710,7 +635,6 @@ def process_openai_file_to_ocr():
                 except Exception:
                     original_filename = "uploaded.pdf"
 
-        # B) fallback: OpenAI Files API
         if pdf_bytes is None and openai_file_id:
             logging.info(f"Using OpenAI file ID: {openai_file_id}")
             file_metadata = client.files.retrieve(openai_file_id)
@@ -724,7 +648,6 @@ def process_openai_file_to_ocr():
         if not safe_name.lower().endswith(".pdf"):
             safe_name += ".pdf"
 
-        # Assuming these helper functions are defined elsewhere in your code
         material_name = extract_material_name_from_filename(safe_name)
 
         unique_pdf_name = f"{uuid.uuid4().hex}_{timestamp}_{safe_name}"
@@ -749,21 +672,18 @@ def process_openai_file_to_ocr():
 
             pix = page.get_pixmap(matrix=mat)
 
-            # Save direct render (no rotation)
             filename = f"oa_page_{i+1}_{timestamp}.png"
             image_path = OUTPUT_FOLDER / filename
             pix.save(str(image_path))
 
-            # Run OCR directly on the newly saved image
             ocr_text_list = run_paddle_ocr_on_file(image_path)
             
-            # Prepare Response URLs
             view_url = f"{base_url}/images/{filename}"
             dl_url   = f"{base_url}/download-image/{filename}"
 
             processed_pages.append({
                 "page": i + 1,
-                "url": view_url,  # Display link added here
+                "url": view_url,
                 "download_link_image": dl_url,
                 "filename": filename,
                 "ocr_text": ocr_text_list
@@ -774,7 +694,6 @@ def process_openai_file_to_ocr():
 
         doc.close()
 
-        # Detect if this is an MSDS file and extract reference
         reference = None
         if original_filename and ('SDS' in original_filename.upper() or 'MSDS' in original_filename.upper()):
             reference = extract_reference_from_msds_filename(original_filename)
@@ -798,18 +717,9 @@ def process_openai_file_to_ocr():
         return jsonify({"success": False, "error": str(e)}), 500
 
     finally:
-        # Clean up the temporary PDF file to save disk space
         if local_pdf_path and Path(local_pdf_path).exists():
             with contextlib.suppress(Exception):
                 os.remove(local_pdf_path)
-
-
-
-
-
-
-
-
 
 
 @app.route("/process-pdf-to-ocr", methods=["POST"])
@@ -822,14 +732,12 @@ def process_pdf_to_ocr():
 
     data = request.get_json()
     
-    # Handle openaiFileIdRefs array (Claude's format)
     openai_file_id_refs = data.get("openaiFileIdRefs")
     download_link = data.get("download_link")
     openai_file_id = data.get("openai_file_id")
     max_pages = int(data.get("max_pages", 20))
     original_filename = None
 
-    # Extract from openaiFileIdRefs if present (priority #1)
     if openai_file_id_refs and isinstance(openai_file_id_refs, list) and len(openai_file_id_refs) > 0:
         first_ref = openai_file_id_refs[0]
         download_link = first_ref.get("download_link")
@@ -848,7 +756,6 @@ def process_pdf_to_ocr():
     try:
         pdf_bytes = None
 
-        # A) preferred: direct download link
         if download_link:
             logging.info(f"Downloading from link: {download_link[:100]}...")
             r = requests.get(download_link, stream=True, timeout=60)
@@ -866,7 +773,6 @@ def process_pdf_to_ocr():
                 except Exception:
                     original_filename = "uploaded.pdf"
 
-        # B) fallback: OpenAI Files API
         if pdf_bytes is None and openai_file_id:
             logging.info(f"Using OpenAI file ID: {openai_file_id}")
             file_metadata = client.files.retrieve(openai_file_id)
@@ -921,7 +827,6 @@ def process_pdf_to_ocr():
 
         doc.close()
 
-        # Detect if this is an MSDS file and extract reference
         reference = None
         if original_filename and ('SDS' in original_filename.upper() or 'MSDS' in original_filename.upper()):
             reference = extract_reference_from_msds_filename(original_filename)
@@ -950,10 +855,7 @@ def process_pdf_to_ocr():
 @app.route("/save-ocr-result", methods=["POST"])
 def save_ocr_result():
     if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required"
-        }), 400
+        return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
 
@@ -963,7 +865,6 @@ def save_ocr_result():
     reference = data.get("reference")
     type_matiere = data.get("type_matiere") or material_name
 
-    # ✅ FIX CRITIQUE: accepter string JSON ou dict directement
     if isinstance(specifications, str):
         try:
             specifications = json.loads(specifications)
@@ -974,16 +875,10 @@ def save_ocr_result():
             }), 400
 
     if not material_name:
-        return jsonify({
-            "success": False,
-            "error": "Missing material_name"
-        }), 400
+        return jsonify({"success": False, "error": "Missing material_name"}), 400
 
     if not specifications:
-        return jsonify({
-            "success": False,
-            "error": "Missing specifications JSON"
-        }), 400
+        return jsonify({"success": False, "error": "Missing specifications JSON"}), 400
 
     try:
         matiere_id, fiche_id = save_material_and_fiche(
@@ -1004,25 +899,17 @@ def save_ocr_result():
 
     except ValueError as ve:
         logging.error(f"Validation error: {ve}")
-        return jsonify({
-            "success": False,
-            "error": str(ve)
-        }), 400
+        return jsonify({"success": False, "error": str(ve)}), 400
     except Exception as e:
         logging.error(f"Save OCR Result Error: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/specifications-by-reference", methods=["GET"])
 def get_specifications_by_reference():
     reference = request.args.get("reference")
     if not reference:
-        return jsonify({
-            "success": False,
-            "error": "Missing reference"
-        }), 400
+        return jsonify({"success": False, "error": "Missing reference"}), 400
 
     conn = psycopg2.connect(DB_DSN)
     try:
@@ -1067,17 +954,13 @@ def get_specifications_by_reference():
 @app.route("/update-specification-by-reference", methods=["PUT"])
 def update_specification_by_reference():
     if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required"
-        }), 400
+        return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
     reference = data.get("reference")
     spec_id = data.get("spec_id")
     donnees = data.get("donnees")
 
-    # Safety check: convert string to JSON if needed
     if isinstance(donnees, str):
         donnees = json.loads(donnees)
 
@@ -1153,7 +1036,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
             with conn.cursor() as cur:
                 matiere_id = None
 
-                # 1. Search by name
                 if material_name:
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s",
@@ -1172,7 +1054,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                             (type_matiere, reference, matiere_id)
                         )
 
-                # 2. Search by reference if not found by name
                 if not matiere_id and reference:
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE reference = %s",
@@ -1191,7 +1072,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                             (material_name, type_matiere, matiere_id)
                         )
 
-                # 3. Not found anywhere → CREATE new material with all info
                 if not matiere_id:
                     logging.info(f"Not found → Creating new material: {material_name} ref={reference}")
                     cur.execute(
@@ -1204,7 +1084,6 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
                     matiere_id = cur.fetchone()[0]
                     logging.info(f"Created new material with ID: {matiere_id}")
 
-                # 4. Check if fiche + spec already exists
                 cur.execute(
                     """SELECT f.fiche_id, s.spec_id 
                        FROM public.fiches_matieres f
@@ -1249,11 +1128,19 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
     finally:
         conn.close()
 
+
 # ==================== BLACK MIX ENDPOINTS ====================
+# Structure réelle des tables :
+#   black_mixes        : id, reference, name, status, created_at, updated_at
+#   black_mix_components: id, black_mix_id, matiere_id, component_name, quantity_value, quantity_unit
+#   black_mix_process_steps: id, black_mix_id, step_order, step_name, machine_name, parameters
+#   black_mix_control_plan: id, black_mix_id, parameter_name, target_value, min_value, max_value, unit
+# NOTE: black_mix_products n'existe pas — supprimé car redondant avec black_mixes.reference
+
 
 @app.route("/black-mix/validate-material/<reference>", methods=["GET"])
 def validate_black_mix_material(reference):
-    """Validate if a material reference exists in the database"""
+    """Validate if a material reference exists in the database."""
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
@@ -1287,12 +1174,12 @@ def validate_black_mix_material(reference):
 @app.route("/black-mix/submit", methods=["POST"])
 def submit_black_mix():
     """
-    Submit a complete Black Mix extraction with:
-    - product_reference
-    - mix_name
-    - components (array)
-    - process_steps (array)
-    - control_plan (array)
+    Submit a complete Black Mix with:
+    - product_reference  → stored in black_mixes.reference
+    - mix_name           → stored in black_mixes.name
+    - components         → black_mix_components (component_name, quantity_value, quantity_unit)
+    - process_steps      → black_mix_process_steps (step_order, step_name, machine_name, parameters)
+    - control_plan       → black_mix_control_plan (parameter_name, target_value, min_value, max_value, unit)
     """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
@@ -1304,7 +1191,6 @@ def submit_black_mix():
     components = data.get("components", [])
     process_steps = data.get("process_steps", [])
     control_plan = data.get("control_plan", [])
-    source_file = data.get("source_file")
 
     if not product_reference or not mix_name:
         return jsonify({
@@ -1317,15 +1203,14 @@ def submit_black_mix():
     try:
         with conn:
             with conn.cursor() as cur:
+
+                # --- Validate all material references first ---
                 validation_errors = []
-                
-                # Validate all material references
                 for component in components:
                     ref = component.get("reference")
                     if not ref:
-                        validation_errors.append("Component missing reference")
+                        validation_errors.append("A component is missing its reference")
                         continue
-                    
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE reference = %s",
                         (ref,)
@@ -1336,89 +1221,83 @@ def submit_black_mix():
                 if validation_errors:
                     return jsonify({
                         "success": False,
-                        "message": "Validation errors",
+                        "message": "Validation errors found",
                         "validation_errors": validation_errors
                     }), 400
-                
-                # Create or get product
+
+                # --- Create Black Mix (no black_mix_products table needed) ---
                 cur.execute(
-                    """SELECT id FROM public.black_mix_products 
-                       WHERE reference_frankfurt = %s""",
-                    (product_reference,)
-                )
-                row = cur.fetchone()
-                
-                if row:
-                    product_id = row[0]
-                else:
-                    cur.execute(
-                        """INSERT INTO public.black_mix_products 
-                           (reference_frankfurt, name, created_at, updated_at)
-                           VALUES (%s, %s, NOW(), NOW())
-                           RETURNING id""",
-                        (product_reference, f"Product {product_reference}")
-                    )
-                    product_id = cur.fetchone()[0]
-                
-                # Create Black Mix
-                cur.execute(
-                    """INSERT INTO public.black_mixes 
-                       (product_id, mix_name, source_file, created_at, updated_at)
-                       VALUES (%s, %s, %s, NOW(), NOW())
+                    """INSERT INTO public.black_mixes
+                       (reference, name, status, created_at)
+                       VALUES (%s, %s, 'draft', NOW())
                        RETURNING id""",
-                    (product_id, mix_name, source_file)
+                    (product_reference, mix_name)
                 )
                 black_mix_id = cur.fetchone()[0]
-                
-                # Insert components
+                logging.info(f"Created Black Mix ID={black_mix_id} ref={product_reference}")
+
+                # --- Insert components ---
                 for component in components:
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE reference = %s",
                         (component["reference"],)
                     )
                     matiere_id = cur.fetchone()[0]
-                    
+
                     cur.execute(
                         """INSERT INTO public.black_mix_components
-                           (black_mix_id, matiere_id, quantity_value, quantity_unit, 
-                            tolerance_min, tolerance_max, created_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                        (black_mix_id, matiere_id, component.get("quantity"),
-                         component.get("unit"), component.get("tolerance_min"),
-                         component.get("tolerance_max"))
+                           (black_mix_id, matiere_id, component_name, quantity_value, quantity_unit)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (
+                            black_mix_id,
+                            matiere_id,
+                            component.get("component_name") or component.get("reference"),
+                            component.get("quantity"),
+                            component.get("unit", "phr")
+                        )
                     )
-                
-                # Insert process steps
+
+                # --- Insert process steps ---
                 for step in process_steps:
                     cur.execute(
                         """INSERT INTO public.black_mix_process_steps
-                           (black_mix_id, step_order, step_name, machine, parameters, created_at)
-                           VALUES (%s, %s, %s, %s, %s, NOW())""",
-                        (black_mix_id, step.get("step_order"), step.get("step_name"),
-                         step.get("machine"), Json(step.get("parameters", {})))
+                           (black_mix_id, step_order, step_name, machine_name, parameters)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (
+                            black_mix_id,
+                            step.get("step_order"),
+                            step.get("step_name"),
+                            step.get("machine"),          # mapped from AI field "machine"
+                            Json(step.get("parameters", {}))
+                        )
                     )
-                
-                # Insert control plan
+
+                # --- Insert control plan ---
                 for param in control_plan:
                     cur.execute(
                         """INSERT INTO public.black_mix_control_plan
-                           (black_mix_id, parameter_name, target_value, tolerance, unit, created_at)
-                           VALUES (%s, %s, %s, %s, %s, NOW())""",
-                        (black_mix_id, param.get("parameter_name"),
-                         param.get("target_value"), param.get("tolerance"),
-                         param.get("unit"))
+                           (black_mix_id, parameter_name, target_value, min_value, max_value, unit)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (
+                            black_mix_id,
+                            param.get("parameter_name"),
+                            param.get("target_value"),
+                            param.get("min_value"),
+                            param.get("max_value"),
+                            param.get("unit")
+                        )
                     )
-                
-                logging.info(f"✅ Created Black Mix {mix_name} (ID: {black_mix_id})")
-                
+
+                logging.info(f"✅ Black Mix '{mix_name}' saved successfully (ID={black_mix_id})")
+
                 return jsonify({
                     "success": True,
-                    "message": f"Black Mix {mix_name} created successfully",
+                    "message": f"Black Mix '{mix_name}' created successfully",
                     "black_mix_id": black_mix_id,
-                    "product_id": product_id,
+                    "product_reference": product_reference,
                     "validation_errors": []
                 }), 200
-                
+
     except Exception as e:
         logging.error(f"Submit Black Mix error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1428,25 +1307,24 @@ def submit_black_mix():
 
 @app.route("/black-mix/list", methods=["GET"])
 def list_black_mixes():
-    """Get all Black Mixes"""
+    """Get all Black Mixes."""
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT bm.id, bm.mix_name, bm.created_at, 
-                          bp.reference_frankfurt as product_reference
-                   FROM public.black_mixes bm
-                   JOIN public.black_mix_products bp ON bm.product_id = bp.id
-                   ORDER BY bm.created_at DESC"""
+                """SELECT id, reference, name, status, created_at
+                   FROM public.black_mixes
+                   ORDER BY created_at DESC"""
             )
             rows = cur.fetchall()
             
             black_mixes = [
                 {
                     "id": r[0],
-                    "mix_name": r[1],
-                    "created_at": r[2].isoformat() if r[2] else None,
-                    "product_reference": r[3]
+                    "product_reference": r[1],
+                    "mix_name": r[2],
+                    "status": r[3],
+                    "created_at": r[4].isoformat() if r[4] else None
                 }
                 for r in rows
             ]
@@ -1455,7 +1333,7 @@ def list_black_mixes():
                 "success": True,
                 "black_mixes": black_mixes
             }), 200
-            
+
     except Exception as e:
         logging.error(f"List Black Mixes error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1465,17 +1343,16 @@ def list_black_mixes():
 
 @app.route("/black-mix/<int:mix_id>", methods=["GET"])
 def get_black_mix_details(mix_id):
-    """Get complete details of a Black Mix"""
+    """Get complete details of a Black Mix."""
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            # Base info
+
+            # --- Base info ---
             cur.execute(
-                """SELECT bm.id, bm.mix_name, bm.source_file, bm.created_at,
-                          bp.reference_frankfurt, bp.name as product_name
-                   FROM public.black_mixes bm
-                   JOIN public.black_mix_products bp ON bm.product_id = bp.id
-                   WHERE bm.id = %s""",
+                """SELECT id, reference, name, status, created_at
+                   FROM public.black_mixes
+                   WHERE id = %s""",
                 (mix_id,)
             )
             row = cur.fetchone()
@@ -1485,16 +1362,16 @@ def get_black_mix_details(mix_id):
             
             result = {
                 "id": row[0],
-                "mix_name": row[1],
-                "source_file": row[2],
-                "created_at": row[3].isoformat() if row[3] else None,
-                "product_reference": row[4],
-                "product_name": row[5]
+                "product_reference": row[1],
+                "mix_name": row[2],
+                "status": row[3],
+                "created_at": row[4].isoformat() if row[4] else None
             }
-            
-            # Components
+
+            # --- Components ---
             cur.execute(
-                """SELECT c.*, m.reference, m.nom_matiere
+                """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
+                          m.reference, m.nom_matiere
                    FROM public.black_mix_components c
                    JOIN public.matieres m ON c.matiere_id = m.matiere_id
                    WHERE c.black_mix_id = %s""",
@@ -1502,19 +1379,19 @@ def get_black_mix_details(mix_id):
             )
             result["components"] = [
                 {
-                    "reference": r[7],
-                    "material_name": r[8],
-                    "quantity": float(r[3]) if r[3] else None,
-                    "unit": r[4],
-                    "tolerance_min": float(r[5]) if r[5] else None,
-                    "tolerance_max": float(r[6]) if r[6] else None
+                    "id": r[0],
+                    "component_name": r[1],
+                    "quantity": float(r[2]) if r[2] is not None else None,
+                    "unit": r[3],
+                    "reference": r[4],
+                    "material_name": r[5]
                 }
                 for r in cur.fetchall()
             ]
-            
-            # Process steps
+
+            # --- Process steps ---
             cur.execute(
-                """SELECT step_order, step_name, machine, parameters
+                """SELECT step_order, step_name, machine_name, parameters
                    FROM public.black_mix_process_steps
                    WHERE black_mix_id = %s
                    ORDER BY step_order""",
@@ -1529,10 +1406,10 @@ def get_black_mix_details(mix_id):
                 }
                 for r in cur.fetchall()
             ]
-            
-            # Control plan
+
+            # --- Control plan ---
             cur.execute(
-                """SELECT parameter_name, target_value, tolerance, unit
+                """SELECT parameter_name, target_value, min_value, max_value, unit
                    FROM public.black_mix_control_plan
                    WHERE black_mix_id = %s""",
                 (mix_id,)
@@ -1540,28 +1417,31 @@ def get_black_mix_details(mix_id):
             result["control_plan"] = [
                 {
                     "parameter_name": r[0],
-                    "target_value": r[1],
-                    "tolerance": r[2],
-                    "unit": r[3]
+                    "target_value": float(r[1]) if r[1] is not None else None,
+                    "min_value": float(r[2]) if r[2] is not None else None,
+                    "max_value": float(r[3]) if r[3] is not None else None,
+                    "unit": r[4]
                 }
                 for r in cur.fetchall()
             ]
-            
+
             return jsonify({
                 "success": True,
                 "black_mix": result
             }), 200
-            
+
     except Exception as e:
         logging.error(f"Get Black Mix details error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
-        
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Simple health check endpoint."""
     return jsonify({"status": "ok", "service": "ocr_api"}), 200
+
 
 if __name__ == "__main__":
     logging.info("Starting RFQ Processing API on port 5000")
