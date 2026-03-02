@@ -254,7 +254,7 @@ def upload_temp_pdf():
         if pdf_bytes is None:
             return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
 
-        # Save temp file
+        #  temp file
         safe = secure_filename(original_name) or "uploaded.pdf"
         if not safe.lower().endswith(".pdf"):
             safe += ".pdf"
@@ -284,7 +284,7 @@ def upload_temp_pdf_and_ocr():
     """
     Combined endpoint:
       - Upload/download PDF (same inputs as /upload-temp-pdf)
-      - Save as temp file
+      -  as temp file
       - Run OCR (same behavior as /process-pdf-to-ocr)
       - Return temp_url + OCR results
     """
@@ -371,7 +371,7 @@ def upload_temp_pdf_and_ocr():
 
             raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
             raw_path = OUTPUT_FOLDER / raw_filename
-            pix.save(str(raw_path))
+            pix.(str(raw_path))
 
             upright_filename = f"oa_upright_{i+1}_{timestamp}.png"
             upright_path = OUTPUT_FOLDER / upright_filename
@@ -963,6 +963,16 @@ def save_ocr_result():
     reference = data.get("reference")
     type_matiere = data.get("type_matiere") or material_name
 
+    # ✅ FIX CRITIQUE: accepter string JSON ou dict directement
+    if isinstance(specifications, str):
+        try:
+            specifications = json.loads(specifications)
+        except json.JSONDecodeError:
+            return jsonify({
+                "success": False,
+                "error": "Invalid JSON string in 'specifications'. Must be valid JSON."
+            }), 400
+
     if not material_name:
         return jsonify({
             "success": False,
@@ -1004,7 +1014,6 @@ def save_ocr_result():
             "success": False,
             "error": str(e)
         }), 500
-
 
 @app.route("/specifications-by-reference", methods=["GET"])
 def get_specifications_by_reference():
