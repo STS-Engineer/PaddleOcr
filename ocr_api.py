@@ -1269,9 +1269,10 @@ def submit_black_mix():
     Submit a complete Black Mix with:
     - product_reference  → stored in black_mixes.reference
     - mix_name           → stored in black_mixes.name
-    - components         → black_mix_components (component_name, quantity_value, quantity_unit)
+    - components         → black_mix_components (component_name, quantity_value, quantity_unit, metadata)
     - process_steps      → black_mix_process_steps (step_order, step_name, machine_name, parameters)
     - control_plan       → black_mix_control_plan (parameter_name, target_value, min_value, max_value, unit)
+    - document_revision_history → stored in black_mixes.document_revision_history (JSONB)
     """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
@@ -1283,6 +1284,7 @@ def submit_black_mix():
     components = data.get("components", [])
     process_steps = data.get("process_steps", [])
     control_plan = data.get("control_plan", [])
+    document_revision_history = data.get("document_revision_history")
 
     if not product_reference or not mix_name:
         return jsonify({
@@ -1317,16 +1319,23 @@ def submit_black_mix():
                         "validation_errors": validation_errors
                     }), 400
 
-                # --- Create Black Mix (no black_mix_products table needed) ---
+                # --- Create Black Mix with document revision history ---
                 cur.execute(
                     """INSERT INTO public.black_mixes
-                       (reference, name, status, created_at)
-                       VALUES (%s, %s, 'draft', NOW())
+                       (reference, name, status, created_at, document_revision_history)
+                       VALUES (%s, %s, 'draft', NOW(), %s)
                        RETURNING id""",
-                    (product_reference, mix_name)
+                    (
+                        product_reference, 
+                        mix_name,
+                        Json(document_revision_history) if document_revision_history else None
+                    )
                 )
                 black_mix_id = cur.fetchone()[0]
                 logging.info(f"Created Black Mix ID={black_mix_id} ref={product_reference}")
+                if document_revision_history:
+                    current_version = document_revision_history.get("current_version", "unknown")
+                    logging.info(f"  └─ Document revision history: {current_version}")
 
                 # --- Insert components ---
                 for component in components:
@@ -1492,7 +1501,7 @@ def get_black_mix_details(mix_id):
 
             # --- Base info ---
             cur.execute(
-                """SELECT id, reference, name, status, created_at
+                """SELECT id, reference, name, status, created_at, document_revision_history
                    FROM public.black_mixes
                    WHERE id = %s""",
                 (mix_id,)
@@ -1507,7 +1516,8 @@ def get_black_mix_details(mix_id):
                 "product_reference": row[1],
                 "mix_name": row[2],
                 "status": row[3],
-                "created_at": row[4].isoformat() if row[4] else None
+                "created_at": row[4].isoformat() if row[4] else None,
+                "document_revision_history": row[5]
             }
 
             # --- Components ---
