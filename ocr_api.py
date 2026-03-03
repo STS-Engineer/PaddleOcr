@@ -1129,6 +1129,98 @@ def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: d
         conn.close()
 
 
+def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name):
+    """
+    Build complete JSON snapshot (ADN) of Black Mix for archiving/export/PDF generation.
+    Uses existing database cursor to gather all related data.
+    """
+    # Fetch all components with metadata
+    cur.execute(
+        """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
+                  m.reference, m.nom_matiere, c.metadata
+           FROM public.black_mix_components c
+           JOIN public.matieres m ON c.matiere_id = m.matiere_id
+           WHERE c.black_mix_id = %s
+           ORDER BY c.id""",
+        (black_mix_id,)
+    )
+    components = [
+        {
+            "id": r[0],
+            "component_name": r[1],
+            "quantity": float(r[2]) if r[2] is not None else None,
+            "unit": r[3],
+            "reference": r[4],
+            "material_name": r[5],
+            "metadata": r[6]
+        }
+        for r in cur.fetchall()
+    ]
+
+    # Fetch all process steps
+    cur.execute(
+        """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
+                  ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
+           FROM public.black_mix_process_steps s
+           LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
+           LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
+           WHERE s.black_mix_id = %s
+           GROUP BY s.id, s.step_order, s.step_name, s.machine_name, s.parameters
+           ORDER BY s.step_order""",
+        (black_mix_id,)
+    )
+    process_steps = [
+        {
+            "step_order": r[1],
+            "step_name": r[2],
+            "machine": r[3],
+            "parameters": r[4],
+            "materials": list(r[5]) if r[5] and r[5][0] is not None else []
+        }
+        for r in cur.fetchall()
+    ]
+
+    # Build step_materials mapping
+    step_materials = {}
+    for step in process_steps:
+        step_materials[str(step["step_order"])] = step["materials"]
+
+    # Fetch control plan
+    cur.execute(
+        """SELECT parameter_name, target_value, min_value, max_value, unit
+           FROM public.black_mix_control_plan
+           WHERE black_mix_id = %s
+           ORDER BY parameter_name""",
+        (black_mix_id,)
+    )
+    control_plan = [
+        {
+            "parameter_name": r[0],
+            "target_value": float(r[1]) if r[1] is not None else None,
+            "min_value": float(r[2]) if r[2] is not None else None,
+            "max_value": float(r[3]) if r[3] is not None else None,
+            "unit": r[4]
+        }
+        for r in cur.fetchall()
+    ]
+
+    # Build complete ADN snapshot
+    adn = {
+        "black_mix_id": black_mix_id,
+        "product_reference": product_reference,
+        "mix_name": mix_name,
+        "status": "draft",
+        "created_at": datetime.now().isoformat(),
+        "composition": components,
+        "process_steps": process_steps,
+        "step_materials": step_materials,
+        "control_plan": control_plan,
+        "snapshot_timestamp": datetime.now().isoformat()
+    }
+    
+    return adn
+
+
 # ==================== BLACK MIX ENDPOINTS ====================
 # Structure réelle des tables :
 #   black_mixes        : id, reference, name, status, created_at, updated_at
@@ -1315,6 +1407,24 @@ def submit_black_mix():
                         )
                     )
 
+                # --- Build and save Black Mix ADN (DNA/snapshot) ---
+                adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
+                
+                # Upsert into black_mix_adn table
+                cur.execute(
+                    """INSERT INTO public.black_mix_adn
+                       (black_mix_id, adn_text, version, created_at)
+                       VALUES (%s, %s, 1, NOW())
+                       ON CONFLICT (black_mix_id) DO UPDATE
+                       SET adn_text = EXCLUDED.adn_text,
+                           version = black_mix_adn.version + 1
+                       RETURNING id, version""",
+                    (black_mix_id, Json(adn_snapshot))
+                )
+                adn_result = cur.fetchone()
+                adn_id, adn_version = adn_result[0], adn_result[1] if adn_result else (None, 1)
+                
+                logging.info(f"✅ Black Mix ADN saved (ID={adn_id}, version={adn_version})")
                 logging.info(f"✅ Black Mix '{mix_name}' saved successfully (ID={black_mix_id})")
 
                 return jsonify({
@@ -1322,7 +1432,12 @@ def submit_black_mix():
                     "message": f"Black Mix '{mix_name}' created successfully",
                     "black_mix_id": black_mix_id,
                     "product_reference": product_reference,
-                    "validation_errors": []
+                    "validation_errors": [],
+                    "adn": {
+                        "id": adn_id,
+                        "version": adn_version,
+                        "snapshot_created_at": datetime.now().isoformat()
+                    }
                 }), 200
 
     except Exception as e:
@@ -1469,6 +1584,47 @@ def get_black_mix_details(mix_id):
 
     except Exception as e:
         logging.error(f"Get Black Mix details error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/<int:mix_id>/adn", methods=["GET"])
+def get_black_mix_adn(mix_id):
+    """Retrieve the ADN (DNA/snapshot) of a Black Mix for export/PDF/archiving."""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            # Get ADN from database
+            cur.execute(
+                """SELECT id, black_mix_id, adn_text, version, created_at
+                   FROM public.black_mix_adn
+                   WHERE black_mix_id = %s""",
+                (mix_id,)
+            )
+            row = cur.fetchone()
+            
+            if not row:
+                return jsonify({
+                    "success": False,
+                    "error": "ADN not found for this Black Mix"
+                }), 404
+            
+            adn_id, black_mix_id, adn_text, version, created_at = row
+            
+            return jsonify({
+                "success": True,
+                "adn": {
+                    "id": adn_id,
+                    "black_mix_id": black_mix_id,
+                    "version": version,
+                    "created_at": created_at.isoformat() if created_at else None,
+                    "snapshot": adn_text
+                }
+            }), 200
+
+    except Exception as e:
+        logging.error(f"Get Black Mix ADN error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
