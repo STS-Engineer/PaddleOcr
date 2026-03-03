@@ -1246,14 +1246,15 @@ def submit_black_mix():
 
                     cur.execute(
                         """INSERT INTO public.black_mix_components
-                           (black_mix_id, matiere_id, component_name, quantity_value, quantity_unit)
-                           VALUES (%s, %s, %s, %s, %s)""",
+                           (black_mix_id, matiere_id, component_name, quantity_value, quantity_unit, metadata)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
                         (
                             black_mix_id,
                             matiere_id,
                             component.get("component_name") or component.get("reference"),
                             component.get("quantity"),
-                            component.get("unit", "phr")
+                            component.get("unit", "phr"),
+                            Json(component.get("metadata", {}))
                         )
                     )
 
@@ -1397,7 +1398,7 @@ def get_black_mix_details(mix_id):
             # --- Components ---
             cur.execute(
                 """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
-                          m.reference, m.nom_matiere
+                          m.reference, m.nom_matiere, c.metadata
                    FROM public.black_mix_components c
                    JOIN public.matieres m ON c.matiere_id = m.matiere_id
                    WHERE c.black_mix_id = %s""",
@@ -1410,7 +1411,8 @@ def get_black_mix_details(mix_id):
                     "quantity": float(r[2]) if r[2] is not None else None,
                     "unit": r[3],
                     "reference": r[4],
-                    "material_name": r[5]
+                    "material_name": r[5],
+                    "metadata": r[6]
                 }
                 for r in cur.fetchall()
             ]
