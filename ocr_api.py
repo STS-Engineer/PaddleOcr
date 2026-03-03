@@ -1419,19 +1419,40 @@ def submit_black_mix():
                 # --- Build and save Black Mix ADN (DNA/snapshot) ---
                 adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
                 
-                # Upsert into black_mix_adn table
+                # Save ADN without relying on a UNIQUE constraint for ON CONFLICT
                 cur.execute(
-                    """INSERT INTO public.black_mix_adn
-                       (black_mix_id, adn_text, version, created_at)
-                       VALUES (%s, %s, 1, NOW())
-                       ON CONFLICT (black_mix_id) DO UPDATE
-                       SET adn_text = EXCLUDED.adn_text,
-                           version = black_mix_adn.version + 1
-                       RETURNING id, version""",
-                    (black_mix_id, Json(adn_snapshot))
+                    """SELECT id, version
+                       FROM public.black_mix_adn
+                       WHERE black_mix_id = %s
+                       ORDER BY id DESC
+                       LIMIT 1""",
+                    (black_mix_id,)
                 )
+                existing_adn = cur.fetchone()
+
+                if existing_adn:
+                    existing_adn_id, existing_version = existing_adn
+                    next_version = (existing_version or 0) + 1
+                    cur.execute(
+                        """UPDATE public.black_mix_adn
+                           SET adn_text = %s,
+                               version = %s,
+                               created_at = NOW()
+                           WHERE id = %s
+                           RETURNING id, version""",
+                        (Json(adn_snapshot), next_version, existing_adn_id)
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO public.black_mix_adn
+                           (black_mix_id, adn_text, version, created_at)
+                           VALUES (%s, %s, 1, NOW())
+                           RETURNING id, version""",
+                        (black_mix_id, Json(adn_snapshot))
+                    )
+
                 adn_result = cur.fetchone()
-                adn_id, adn_version = adn_result[0], adn_result[1] if adn_result else (None, 1)
+                adn_id, adn_version = (adn_result[0], adn_result[1]) if adn_result else (None, None)
                 
                 logging.info(f"✅ Black Mix ADN saved (ID={adn_id}, version={adn_version})")
                 logging.info(f"✅ Black Mix '{mix_name}' saved successfully (ID={black_mix_id})")
