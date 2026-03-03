@@ -1165,7 +1165,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
            LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
            LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
            WHERE s.black_mix_id = %s
-           GROUP BY s.id, s.step_order, s.step_name, s.machine_name, s.parameters
+           GROUP BY s.id
            ORDER BY s.step_order""",
         (black_mix_id,)
     )
@@ -1553,7 +1553,7 @@ def get_black_mix_details(mix_id):
                 LEFT JOIN public.matieres m
                     ON m.matiere_id = sm.matiere_id
                 WHERE s.black_mix_id = %s
-                GROUP BY s.id, s.step_order, s.step_name, s.machine_name, s.parameters
+                GROUP BY s.id
                 ORDER BY s.step_order
                 """,
                 (mix_id,)
