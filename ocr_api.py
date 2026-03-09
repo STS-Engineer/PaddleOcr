@@ -1271,6 +1271,7 @@ def submit_black_mix():
     - mix_name           → stored in black_mixes.name
     - components         → black_mix_components (component_name, quantity_value, quantity_unit, metadata)
     - process_steps      → black_mix_process_steps (step_order, step_name, machine_name, parameters)
+    - step_materials     → black_mix_step_materials (process_step_id, matiere_id) ← TOP-LEVEL FIELD
     - control_plan       → black_mix_control_plan (parameter_name, target_value, min_value, max_value, unit)
     - document_revision_history → stored in black_mixes.document_revision_history (JSONB)
     """
@@ -1278,11 +1279,12 @@ def submit_black_mix():
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
-    
+
     product_reference = data.get("product_reference")
     mix_name = data.get("mix_name")
     components = data.get("components", [])
     process_steps = data.get("process_steps", [])
+    step_materials_map = data.get("step_materials", {})   # ✅ TOP-LEVEL READ
     control_plan = data.get("control_plan", [])
     document_revision_history = data.get("document_revision_history")
 
@@ -1293,12 +1295,14 @@ def submit_black_mix():
         }), 400
 
     conn = psycopg2.connect(DB_DSN)
-    
+
     try:
         with conn:
             with conn.cursor() as cur:
 
-                # --- Validate all material references first ---
+                # ----------------------------------------------------------------
+                # 1. Validate all material references in components
+                # ----------------------------------------------------------------
                 validation_errors = []
                 for component in components:
                     ref = component.get("reference")
@@ -1311,7 +1315,7 @@ def submit_black_mix():
                     )
                     if not cur.fetchone():
                         validation_errors.append(f"Invalid material reference: {ref}")
-                
+
                 if validation_errors:
                     return jsonify({
                         "success": False,
@@ -1319,25 +1323,30 @@ def submit_black_mix():
                         "validation_errors": validation_errors
                     }), 400
 
-                # --- Create Black Mix with document revision history ---
+                # ----------------------------------------------------------------
+                # 2. Create Black Mix record
+                # ----------------------------------------------------------------
                 cur.execute(
                     """INSERT INTO public.black_mixes
                        (reference, name, status, created_at, document_revision_history)
                        VALUES (%s, %s, 'draft', NOW(), %s)
                        RETURNING id""",
                     (
-                        product_reference, 
+                        product_reference,
                         mix_name,
                         Json(document_revision_history) if document_revision_history else None
                     )
                 )
                 black_mix_id = cur.fetchone()[0]
                 logging.info(f"Created Black Mix ID={black_mix_id} ref={product_reference}")
+
                 if document_revision_history:
                     current_version = document_revision_history.get("current_version", "unknown")
                     logging.info(f"  └─ Document revision history: {current_version}")
 
-                # --- Insert components ---
+                # ----------------------------------------------------------------
+                # 3. Insert components
+                # ----------------------------------------------------------------
                 for component in components:
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE reference = %s",
@@ -1358,11 +1367,15 @@ def submit_black_mix():
                             Json(component.get("metadata", {}))
                         )
                     )
+                logging.info(f"  └─ {len(components)} components inserted")
 
-                # --- Insert process steps + step-materials ---
+                # ----------------------------------------------------------------
+                # 4. Insert process steps + step materials
+                # ----------------------------------------------------------------
+                total_step_materials = 0
+
                 for step in process_steps:
-
-                    # Insert step and get its ID
+                    # Insert process step
                     cur.execute(
                         """INSERT INTO public.black_mix_process_steps
                            (black_mix_id, step_order, step_name, machine_name, parameters)
@@ -1376,31 +1389,45 @@ def submit_black_mix():
                             Json(step.get("parameters", {}))
                         )
                     )
-
                     process_step_id = cur.fetchone()[0]
 
-                    # Insert step-materials mapping
-                    materials = step.get("materials", [])
+                    # ✅ Read materials from top-level step_materials dict
+                    step_order_key = str(step.get("step_order"))
+                    materials = step_materials_map.get(step_order_key, [])
+
+                    logging.info(
+                        f"  └─ Step {step_order_key} '{step.get('step_name')}' "
+                        f"→ {len(materials)} material(s)"
+                    )
+
                     for ref in materials:
                         cur.execute(
                             "SELECT matiere_id FROM public.matieres WHERE reference = %s",
                             (ref,)
                         )
                         mat_row = cur.fetchone()
+
                         if not mat_row:
-                            raise ValueError(f"Invalid material reference in step: {ref}")
+                            # ✅ Log warning but do NOT crash — skip unknown refs
+                            logging.warning(
+                                f"    ⚠️  Material ref '{ref}' not found in step {step_order_key}, skipping"
+                            )
+                            continue
 
-                        matiere_id = mat_row[0]
-
+                        # ✅ No ON CONFLICT — duplicates are kept as requested
                         cur.execute(
                             """INSERT INTO public.black_mix_step_materials
                                (process_step_id, matiere_id)
-                               VALUES (%s, %s)
-                               ON CONFLICT DO NOTHING""",
-                            (process_step_id, matiere_id)
+                               VALUES (%s, %s)""",
+                            (process_step_id, mat_row[0])
                         )
+                        total_step_materials += 1
 
-                # --- Insert control plan ---
+                logging.info(f"  └─ {total_step_materials} step-material links inserted total")
+
+                # ----------------------------------------------------------------
+                # 5. Insert control plan
+                # ----------------------------------------------------------------
                 for param in control_plan:
                     cur.execute(
                         """INSERT INTO public.black_mix_control_plan
@@ -1415,11 +1442,15 @@ def submit_black_mix():
                             param.get("unit")
                         )
                     )
+                logging.info(f"  └─ {len(control_plan)} control plan parameters inserted")
 
-                # --- Build and save Black Mix ADN (DNA/snapshot) ---
-                adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
-                
-                # Save ADN without relying on a UNIQUE constraint for ON CONFLICT
+                # ----------------------------------------------------------------
+                # 6. Build and save Black Mix ADN (DNA snapshot)
+                # ----------------------------------------------------------------
+                adn_snapshot = build_black_mix_adn_snapshot(
+                    cur, black_mix_id, product_reference, mix_name
+                )
+
                 cur.execute(
                     """SELECT id, version
                        FROM public.black_mix_adn
@@ -1453,7 +1484,7 @@ def submit_black_mix():
 
                 adn_result = cur.fetchone()
                 adn_id, adn_version = (adn_result[0], adn_result[1]) if adn_result else (None, None)
-                
+
                 logging.info(f"✅ Black Mix ADN saved (ID={adn_id}, version={adn_version})")
                 logging.info(f"✅ Black Mix '{mix_name}' saved successfully (ID={black_mix_id})")
 
@@ -1475,7 +1506,6 @@ def submit_black_mix():
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
-
 
 @app.route("/black-mix/list", methods=["GET"])
 def list_black_mixes():
