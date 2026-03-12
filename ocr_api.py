@@ -1467,4 +1467,4 @@ def health_check():
 
 if __name__ == "__main__":
     logging.info("Starting RFQ Processing API on port 5000")
-    app.run(debug=True, host='0.0.0.0', port=5000)d
+    app.run(debug=True, host='0.0.0.0', port=5000)
