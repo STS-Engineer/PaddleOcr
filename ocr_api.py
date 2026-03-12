@@ -284,26 +284,38 @@ def resolve_component(cur, component: dict):
     component_name = (component.get("component_name") or "").strip()
     reference = (component.get("reference") or "").strip()
 
-    # --- 1. Match by name against black_mixes ---
+    # Pre-compute space-stripped versions for loose matching
+    # e.g. "00094" matches name "000 94", "BlackMix 00094" → stripped = "BlackMix00094"
+    reference_no_spaces = reference.replace(" ", "").lower()
+    component_name_no_spaces = component_name.replace(" ", "").lower()
+
+    # --- 1. Match component_name against black_mixes.name (exact, then space-stripped) ---
     if component_name:
         cur.execute(
-            "SELECT id FROM public.black_mixes WHERE LOWER(TRIM(name)) = LOWER(%s) LIMIT 1",
-            (component_name,)
+            """SELECT id, name FROM public.black_mixes
+               WHERE LOWER(TRIM(name)) = LOWER(%s)
+                  OR LOWER(REPLACE(name, ' ', '')) = %s
+               LIMIT 1""",
+            (component_name, component_name_no_spaces)
         )
         row = cur.fetchone()
         if row:
-            logging.info(f"  Component '{component_name}' resolved as Black Mix id={row[0]} (by name)")
-            return {"type": "black_mix", "matiere_id": None, "sub_black_mix_id": row[0], "resolved_name": component_name}
+            logging.info(f"  Component '{component_name}' resolved as Black Mix id={row[0]} name='{row[1]}' (by name)")
+            return {"type": "black_mix", "matiere_id": None, "sub_black_mix_id": row[0], "resolved_name": row[1]}
 
-    # --- 2. Match reference against black_mixes.reference ---
+    # --- 2. Match reference against black_mixes.name (space-stripped) ---
+    #        e.g. reference "00094" matches name "000 94"
     if reference:
         cur.execute(
-            "SELECT id, name FROM public.black_mixes WHERE LOWER(TRIM(reference)) = LOWER(%s) LIMIT 1",
-            (reference,)
+            """SELECT id, name FROM public.black_mixes
+               WHERE LOWER(REPLACE(name, ' ', '')) = %s
+                  OR LOWER(TRIM(reference)) = LOWER(%s)
+               LIMIT 1""",
+            (reference_no_spaces, reference)
         )
         row = cur.fetchone()
         if row:
-            logging.info(f"  Component ref='{reference}' resolved as Black Mix id={row[0]} name='{row[1]}' (by reference)")
+            logging.info(f"  Component ref='{reference}' resolved as Black Mix id={row[0]} name='{row[1]}' (by name/ref)")
             return {"type": "black_mix", "matiere_id": None, "sub_black_mix_id": row[0], "resolved_name": row[1]}
 
     # --- 3. Match reference against matieres ---
@@ -1032,23 +1044,36 @@ def resolve_component_endpoint():
 
 @app.route("/black-mix/validate-material/<reference>", methods=["GET"])
 def validate_black_mix_material(reference):
-    """Validate if a material reference exists in matieres OR as a Black Mix."""
+    """
+    Validate if a reference exists in matieres OR as a Black Mix.
+    Matching for Black Mixes:
+      1. black_mixes.reference exact match
+      2. black_mixes.name stripped of spaces (e.g. '00094' matches name '000 94')
+    """
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            # Check matieres
+            # 1. Check matieres
             cur.execute("SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s", (reference,))
             mat_row = cur.fetchone()
             if mat_row:
                 return jsonify({"reference": reference, "exists": True, "type": "material",
                                 "material_name": mat_row[1], "matiere_id": mat_row[0]}), 200
 
-            # Check black_mixes by reference
-            cur.execute("SELECT id, name FROM public.black_mixes WHERE LOWER(TRIM(reference)) = LOWER(%s)", (reference,))
+            # 2. Check black_mixes by product reference OR name stripped of spaces
+            ref_no_spaces = reference.replace(" ", "").lower()
+            cur.execute(
+                """SELECT id, name, reference FROM public.black_mixes
+                   WHERE LOWER(TRIM(reference)) = LOWER(%s)
+                      OR LOWER(REPLACE(name, ' ', '')) = %s
+                   LIMIT 1""",
+                (reference, ref_no_spaces)
+            )
             mix_row = cur.fetchone()
             if mix_row:
                 return jsonify({"reference": reference, "exists": True, "type": "black_mix",
-                                "material_name": mix_row[1], "black_mix_id": mix_row[0]}), 200
+                                "material_name": mix_row[1], "black_mix_id": mix_row[0],
+                                "product_reference": mix_row[2]}), 200
 
             return jsonify({"reference": reference, "exists": False, "type": None,
                             "material_name": None}), 200
@@ -1442,4 +1467,4 @@ def health_check():
 
 if __name__ == "__main__":
     logging.info("Starting RFQ Processing API on port 5000")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000)d
