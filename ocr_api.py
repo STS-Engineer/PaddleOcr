@@ -67,12 +67,17 @@ def ensure_sub_black_mix_column():
     """
     Adds sub_black_mix_id FK to black_mix_components and makes matiere_id
     nullable so a row can represent either a raw material OR a nested Black Mix.
+    Also adds sub_black_mix_id to black_mix_step_materials so process steps
+    can reference nested mixes too.
     Safe to call on every startup.
     """
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
             with conn.cursor() as cur:
+
+                # ── black_mix_components ──────────────────────────────────────
+
                 # 1. Add sub_black_mix_id if missing
                 cur.execute("""
                     ALTER TABLE public.black_mix_components
@@ -93,9 +98,9 @@ def ensure_sub_black_mix_column():
                         ALTER TABLE public.black_mix_components
                         ALTER COLUMN matiere_id DROP NOT NULL;
                     """)
-                    logging.info("Migration: matiere_id made nullable")
+                    logging.info("Migration: black_mix_components.matiere_id made nullable")
 
-                # 3. Enforce XOR constraint (one of the two must be set)
+                # 3. XOR constraint on black_mix_components
                 cur.execute("""
                     SELECT 1 FROM information_schema.table_constraints
                     WHERE table_schema='public'
@@ -112,6 +117,50 @@ def ensure_sub_black_mix_column():
                         );
                     """)
                     logging.info("Migration: chk_component_type constraint added")
+
+                # ── black_mix_step_materials ──────────────────────────────────
+
+                # 4. Add sub_black_mix_id to step_materials if missing
+                cur.execute("""
+                    ALTER TABLE public.black_mix_step_materials
+                    ADD COLUMN IF NOT EXISTS sub_black_mix_id INTEGER
+                    REFERENCES public.black_mixes(id) ON DELETE SET NULL;
+                """)
+
+                # 5. Make matiere_id nullable in step_materials
+                cur.execute("""
+                    SELECT is_nullable FROM information_schema.columns
+                    WHERE table_schema='public'
+                      AND table_name='black_mix_step_materials'
+                      AND column_name='matiere_id';
+                """)
+                row = cur.fetchone()
+                if row and row[0] == 'NO':
+                    cur.execute("""
+                        ALTER TABLE public.black_mix_step_materials
+                        ALTER COLUMN matiere_id DROP NOT NULL;
+                    """)
+                    logging.info("Migration: black_mix_step_materials.matiere_id made nullable")
+
+                # 6. Update unique constraint to cover both columns
+                cur.execute("""
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE table_schema='public'
+                      AND table_name='black_mix_step_materials'
+                      AND constraint_name='unique_step_matiere_v2';
+                """)
+                if not cur.fetchone():
+                    # Drop old constraint if it exists
+                    cur.execute("""
+                        ALTER TABLE public.black_mix_step_materials
+                        DROP CONSTRAINT IF EXISTS unique_step_matiere;
+                    """)
+                    cur.execute("""
+                        ALTER TABLE public.black_mix_step_materials
+                        ADD CONSTRAINT unique_step_matiere_v2
+                        UNIQUE (process_step_id, matiere_id, sub_black_mix_id);
+                    """)
+                    logging.info("Migration: unique_step_matiere_v2 constraint added")
 
         logging.info("Migration ensure_sub_black_mix_column: OK")
     except Exception as e:
@@ -268,28 +317,27 @@ def resolve_component(cur, component: dict):
     Determine whether a component is a raw material or a nested Black Mix.
 
     Resolution order:
-      1. If component_name matches a black_mixes.name  → sub-mix
-      2. If reference matches a black_mixes.reference  → sub-mix
-      3. If reference matches matieres.reference       → raw material
-      4. Otherwise                                     → unknown (validation error)
+      1. component_name matches black_mixes.name          → sub-mix
+      2. reference      matches black_mixes.reference     → sub-mix
+      3. reference      matches black_mixes.name (space-stripped) → sub-mix
+      4. reference      matches matieres.reference        → raw material
+      5. Otherwise                                        → unknown
 
-    Returns a dict:
+    Returns:
       {
-        "type":           "material" | "black_mix" | "unknown",
-        "matiere_id":     int | None,
+        "type":             "material" | "black_mix" | "unknown",
+        "matiere_id":       int | None,
         "sub_black_mix_id": int | None,
-        "resolved_name":  str,
+        "resolved_name":    str,
       }
     """
     component_name = (component.get("component_name") or "").strip()
     reference = (component.get("reference") or "").strip()
 
-    # Pre-compute space-stripped versions for loose matching
-    # e.g. "00094" matches name "000 94", "BlackMix 00094" → stripped = "BlackMix00094"
     reference_no_spaces = reference.replace(" ", "").lower()
     component_name_no_spaces = component_name.replace(" ", "").lower()
 
-    # --- 1. Match component_name against black_mixes.name (exact, then space-stripped) ---
+    # 1. Match component_name against black_mixes.name
     if component_name:
         cur.execute(
             """SELECT id, name FROM public.black_mixes
@@ -300,25 +348,34 @@ def resolve_component(cur, component: dict):
         )
         row = cur.fetchone()
         if row:
-            logging.info(f"  Component '{component_name}' resolved as Black Mix id={row[0]} name='{row[1]}' (by name)")
-            return {"type": "black_mix", "matiere_id": None, "sub_black_mix_id": row[0], "resolved_name": row[1]}
+            logging.info(f"  Component '{component_name}' → Black Mix id={row[0]} name='{row[1]}' (by name)")
+            return {
+                "type": "black_mix",
+                "matiere_id": None,
+                "sub_black_mix_id": row[0],
+                "resolved_name": row[1]
+            }
 
-    # --- 2. Match reference against black_mixes.name (space-stripped) ---
-    #        e.g. reference "00094" matches name "000 94"
+    # 2 & 3. Match reference against black_mixes.reference OR black_mixes.name (space-stripped)
     if reference:
         cur.execute(
             """SELECT id, name FROM public.black_mixes
-               WHERE LOWER(REPLACE(name, ' ', '')) = %s
-                  OR LOWER(TRIM(reference)) = LOWER(%s)
+               WHERE LOWER(TRIM(reference)) = LOWER(%s)
+                  OR LOWER(REPLACE(name, ' ', '')) = %s
                LIMIT 1""",
-            (reference_no_spaces, reference)
+            (reference, reference_no_spaces)
         )
         row = cur.fetchone()
         if row:
-            logging.info(f"  Component ref='{reference}' resolved as Black Mix id={row[0]} name='{row[1]}' (by name/ref)")
-            return {"type": "black_mix", "matiere_id": None, "sub_black_mix_id": row[0], "resolved_name": row[1]}
+            logging.info(f"  Component ref='{reference}' → Black Mix id={row[0]} name='{row[1]}' (by ref/name)")
+            return {
+                "type": "black_mix",
+                "matiere_id": None,
+                "sub_black_mix_id": row[0],
+                "resolved_name": row[1]
+            }
 
-    # --- 3. Match reference against matieres ---
+    # 4. Match reference against matieres
     if reference:
         cur.execute(
             "SELECT matiere_id FROM public.matieres WHERE reference = %s LIMIT 1",
@@ -326,10 +383,56 @@ def resolve_component(cur, component: dict):
         )
         row = cur.fetchone()
         if row:
-            return {"type": "material", "matiere_id": row[0], "sub_black_mix_id": None, "resolved_name": component_name or reference}
+            return {
+                "type": "material",
+                "matiere_id": row[0],
+                "sub_black_mix_id": None,
+                "resolved_name": component_name or reference
+            }
 
-    # --- 4. Not found anywhere ---
-    return {"type": "unknown", "matiere_id": None, "sub_black_mix_id": None, "resolved_name": component_name or reference}
+    # 5. Not found
+    return {
+        "type": "unknown",
+        "matiere_id": None,
+        "sub_black_mix_id": None,
+        "resolved_name": component_name or reference
+    }
+
+
+def resolve_step_material_ref(cur, ref: str):
+    """
+    Resolve a single reference from step_materials map.
+    Returns the same structure as resolve_component.
+    Checks black_mixes first, then matieres.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+
+    ref_no_spaces = ref.replace(" ", "").lower()
+
+    # Check black_mixes by reference or name
+    cur.execute(
+        """SELECT id, name FROM public.black_mixes
+           WHERE LOWER(TRIM(reference)) = LOWER(%s)
+              OR LOWER(REPLACE(name, ' ', '')) = %s
+           LIMIT 1""",
+        (ref, ref_no_spaces)
+    )
+    row = cur.fetchone()
+    if row:
+        return {"type": "black_mix", "matiere_id": None, "sub_black_mix_id": row[0]}
+
+    # Check matieres
+    cur.execute(
+        "SELECT matiere_id FROM public.matieres WHERE reference = %s LIMIT 1",
+        (ref,)
+    )
+    row = cur.fetchone()
+    if row:
+        return {"type": "material", "matiere_id": row[0], "sub_black_mix_id": None}
+
+    return None
 
 
 def expand_sub_black_mix(cur, sub_black_mix_id: int, visited: set = None) -> dict:
@@ -401,6 +504,8 @@ def expand_sub_black_mix(cur, sub_black_mix_id: int, visited: set = None) -> dic
 
 def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name):
     """Build complete JSON snapshot (ADN) — sub-mix components recursively expanded."""
+
+    # ── Composition ──────────────────────────────────────────────────────────
     cur.execute(
         """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
                   c.matiere_id, c.sub_black_mix_id, c.metadata,
@@ -437,28 +542,48 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
                 "metadata": meta
             })
 
+    # ── Process steps — include both matiere refs and sub-mix refs ────────────
     cur.execute(
-        """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
-                  ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
+        """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters
            FROM public.black_mix_process_steps s
-           LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
-           LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
            WHERE s.black_mix_id = %s
-           GROUP BY s.id
            ORDER BY s.step_order""",
         (black_mix_id,)
     )
-    process_steps = [
-        {
-            "step_order": r[1],
-            "step_name": r[2],
-            "machine": r[3],
-            "parameters": r[4],
-            "materials": list(r[5]) if r[5] and r[5][0] is not None else []
-        }
-        for r in cur.fetchall()
-    ]
+    steps_raw = cur.fetchall()
 
+    process_steps = []
+    for s in steps_raw:
+        step_id, step_order, step_name, machine, parameters = s
+
+        # Fetch step materials: matieres refs + sub-mix refs
+        cur.execute(
+            """SELECT
+                   sm.matiere_id,
+                   sm.sub_black_mix_id,
+                   m.reference         AS mat_ref,
+                   bm.reference        AS sub_bm_ref
+               FROM public.black_mix_step_materials sm
+               LEFT JOIN public.matieres    m  ON m.matiere_id = sm.matiere_id
+               LEFT JOIN public.black_mixes bm ON bm.id        = sm.sub_black_mix_id
+               WHERE sm.process_step_id = %s""",
+            (step_id,)
+        )
+        mat_refs = []
+        for sm in cur.fetchall():
+            ref = sm[3] if sm[1] is not None else sm[2]
+            if ref:
+                mat_refs.append(ref)
+
+        process_steps.append({
+            "step_order": step_order,
+            "step_name": step_name,
+            "machine": machine,
+            "parameters": parameters,
+            "materials": mat_refs,
+        })
+
+    # ── Control plan ─────────────────────────────────────────────────────────
     cur.execute(
         """SELECT parameter_name, target_value, min_value, max_value, unit
            FROM public.black_mix_control_plan
@@ -469,8 +594,8 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
         {
             "parameter_name": r[0],
             "target_value": float(r[1]) if r[1] is not None else None,
-            "min_value": float(r[2]) if r[2] is not None else None,
-            "max_value": float(r[3]) if r[3] is not None else None,
+            "min_value":    float(r[2]) if r[2] is not None else None,
+            "max_value":    float(r[3]) if r[3] is not None else None,
             "unit": r[4]
         }
         for r in cur.fetchall()
@@ -705,8 +830,11 @@ def upload_temp_pdf_and_ocr():
             upright_path = OUTPUT_FOLDER / f"oa_upright_{i+1}_{timestamp}.png"
             angle = save_upright_image(raw_path, upright_path)
             raw_path.unlink(missing_ok=True)
-            processed_pages.append({"page": i+1, "rotation_angle": angle,
-                                     "ocr_text": run_paddle_ocr_on_file(upright_path)})
+            processed_pages.append({
+                "page": i+1,
+                "rotation_angle": angle,
+                "ocr_text": run_paddle_ocr_on_file(upright_path)
+            })
         doc.close()
         reference = None
         if original_name and ("SDS" in original_name.upper() or "MSDS" in original_name.upper()):
@@ -785,8 +913,11 @@ def process_pdf_to_ocr():
             upright_path = OUTPUT_FOLDER / f"oa_upright_{i+1}_{timestamp}.png"
             angle = save_upright_image(raw_path, upright_path)
             raw_path.unlink(missing_ok=True)
-            processed_pages.append({"page": i+1, "rotation_angle": angle,
-                                     "ocr_text": run_paddle_ocr_on_file(upright_path)})
+            processed_pages.append({
+                "page": i+1,
+                "rotation_angle": angle,
+                "ocr_text": run_paddle_ocr_on_file(upright_path)
+            })
         doc.close()
         reference = None
         if original_filename and ('SDS' in original_filename.upper() or 'MSDS' in original_filename.upper()):
@@ -873,7 +1004,8 @@ def process_rfq_id_to_images():
             view_url = f"{base_url}/images/{upright_filename}"
             dl_url = f"{base_url}/download-image/{upright_filename}"
             processed_pages.append({
-                "page": i+1, "url": view_url, "lien_pour_telecharger_l_image": dl_url,
+                "page": i+1, "url": view_url,
+                "lien_pour_telecharger_l_image": dl_url,
                 "filename": upright_filename, "rotation_angle": angle,
                 "ocr_text": run_paddle_ocr_on_file(upright_path)
             })
@@ -925,9 +1057,13 @@ def save_ocr_result():
     if not specifications:
         return jsonify({"success": False, "error": "Missing specifications JSON"}), 400
     try:
-        matiere_id, fiche_id = save_material_and_fiche(material_name, type_matiere, specifications, source, reference)
-        return jsonify({"success": True, "matiere_id": matiere_id, "fiche_id": fiche_id,
-                        "source": source, "reference": reference}), 200
+        matiere_id, fiche_id = save_material_and_fiche(
+            material_name, type_matiere, specifications, source, reference
+        )
+        return jsonify({
+            "success": True, "matiere_id": matiere_id, "fiche_id": fiche_id,
+            "source": source, "reference": reference
+        }), 200
     except Exception as e:
         logging.error(f"Save OCR Result Error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -950,8 +1086,10 @@ def get_specifications_by_reference():
                        WHERE m.reference = %s ORDER BY s.spec_id ASC""",
                     (reference,)
                 )
-                specs = [{"spec_id": r[0], "fiche_id": r[1], "source_type": r[2], "donnees": r[3]}
-                         for r in cur.fetchall()]
+                specs = [
+                    {"spec_id": r[0], "fiche_id": r[1], "source_type": r[2], "donnees": r[3]}
+                    for r in cur.fetchall()
+                ]
         return jsonify({"success": True, "reference": reference, "specifications": specs}), 200
     except Exception as e:
         logging.error(f"Get specifications error: {e}", exc_info=True)
@@ -1004,8 +1142,10 @@ def update_specification_by_reference():
                     "UPDATE public.specifications SET donnees = %s, derniere_modification = NOW() WHERE spec_id = %s",
                     (Json(donnees), spec_id)
                 )
-        return jsonify({"success": True, "matiere_id": matiere_id, "fiche_id": fiche_id,
-                        "spec_id": spec_id, "reference": reference}), 200
+        return jsonify({
+            "success": True, "matiere_id": matiere_id,
+            "fiche_id": fiche_id, "spec_id": spec_id, "reference": reference
+        }), 200
     except Exception as e:
         logging.error(f"Update specification error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1020,10 +1160,8 @@ def update_specification_by_reference():
 @app.route("/black-mix/resolve-component", methods=["GET"])
 def resolve_component_endpoint():
     """
-    Utility endpoint: given a component_name and/or reference, returns
-    whether it resolves to a raw material or a nested Black Mix.
-
-    Query params: component_name, reference
+    Utility: given component_name and/or reference, returns whether it
+    resolves to a raw material or a nested Black Mix.
     """
     component_name = (request.args.get("component_name") or "").strip()
     reference = (request.args.get("reference") or "").strip()
@@ -1046,21 +1184,24 @@ def resolve_component_endpoint():
 def validate_black_mix_material(reference):
     """
     Validate if a reference exists in matieres OR as a Black Mix.
-    Matching for Black Mixes:
-      1. black_mixes.reference exact match
-      2. black_mixes.name stripped of spaces (e.g. '00094' matches name '000 94')
+    Returns type: 'material' | 'black_mix' | null
     """
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            # 1. Check matieres
-            cur.execute("SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s", (reference,))
+            # Check matieres first
+            cur.execute(
+                "SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s",
+                (reference,)
+            )
             mat_row = cur.fetchone()
             if mat_row:
-                return jsonify({"reference": reference, "exists": True, "type": "material",
-                                "material_name": mat_row[1], "matiere_id": mat_row[0]}), 200
+                return jsonify({
+                    "reference": reference, "exists": True, "type": "material",
+                    "material_name": mat_row[1], "matiere_id": mat_row[0]
+                }), 200
 
-            # 2. Check black_mixes by product reference OR name stripped of spaces
+            # Check black_mixes
             ref_no_spaces = reference.replace(" ", "").lower()
             cur.execute(
                 """SELECT id, name, reference FROM public.black_mixes
@@ -1071,12 +1212,16 @@ def validate_black_mix_material(reference):
             )
             mix_row = cur.fetchone()
             if mix_row:
-                return jsonify({"reference": reference, "exists": True, "type": "black_mix",
-                                "material_name": mix_row[1], "black_mix_id": mix_row[0],
-                                "product_reference": mix_row[2]}), 200
+                return jsonify({
+                    "reference": reference, "exists": True, "type": "black_mix",
+                    "material_name": mix_row[1], "black_mix_id": mix_row[0],
+                    "product_reference": mix_row[2]
+                }), 200
 
-            return jsonify({"reference": reference, "exists": False, "type": None,
-                            "material_name": None}), 200
+            return jsonify({
+                "reference": reference, "exists": False,
+                "type": None, "material_name": None
+            }), 200
     except Exception as e:
         logging.error(f"Validate material error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1089,31 +1234,33 @@ def submit_black_mix():
     """
     Submit a complete Black Mix.
 
-    Components are now resolved automatically:
-      - If component_name matches a black_mixes.name  → stored as sub-mix
-      - If reference matches a black_mixes.reference  → stored as sub-mix
-      - If reference matches matieres.reference       → stored as raw material
-      - Otherwise                                     → validation error
+    Components are resolved automatically:
+      - component_name matches black_mixes.name → stored as sub-mix
+      - reference matches black_mixes.reference → stored as sub-mix
+      - reference matches matieres.reference    → stored as raw material
+      - Otherwise                               → validation error
 
-    Payload fields:
-      product_reference, mix_name, components, process_steps,
-      step_materials, control_plan, document_revision_history
+    step_materials references are also resolved against BOTH tables
+    (matieres and black_mixes), and deduplicated per step to avoid
+    unique constraint violations on black_mix_step_materials.
     """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
-    product_reference = data.get("product_reference")
-    mix_name = data.get("mix_name")
-    components = data.get("components", [])
-    process_steps = data.get("process_steps", [])
-    step_materials_map = data.get("step_materials", {})
-    control_plan = data.get("control_plan", [])
+    product_reference         = data.get("product_reference")
+    mix_name                  = data.get("mix_name")
+    components                = data.get("components", [])
+    process_steps             = data.get("process_steps", [])
+    step_materials_map        = data.get("step_materials", {})
+    control_plan              = data.get("control_plan", [])
     document_revision_history = data.get("document_revision_history")
 
     if not product_reference or not mix_name:
-        return jsonify({"success": False,
-                        "error": "Missing required fields: product_reference, mix_name"}), 400
+        return jsonify({
+            "success": False,
+            "error": "Missing required fields: product_reference, mix_name"
+        }), 400
 
     conn = psycopg2.connect(DB_DSN)
     try:
@@ -1126,12 +1273,9 @@ def submit_black_mix():
 
                 for component in components:
                     resolution = resolve_component(cur, component)
-
                     if resolution["type"] == "unknown":
                         label = component.get("component_name") or component.get("reference") or "?"
-                        validation_errors.append(
-                            f"'{label}' not found in materials or Black Mixes"
-                        )
+                        validation_errors.append(f"'{label}' not found in materials or Black Mixes")
                     else:
                         resolved_components.append({**component, **resolution})
 
@@ -1197,6 +1341,12 @@ def submit_black_mix():
                 logging.info(f"  └─ {len(resolved_components)} components inserted")
 
                 # ── 4. Insert process steps + step materials ───────────────────
+                #
+                # KEY FIX: step_materials refs are resolved against BOTH
+                # black_mixes AND matieres, and deduplicated per step
+                # (same matiere_id or sub_black_mix_id only once per step_id)
+                # to avoid violating unique_step_matiere constraint.
+                #
                 total_step_materials = 0
                 for step in process_steps:
                     cur.execute(
@@ -1214,22 +1364,62 @@ def submit_black_mix():
                     process_step_id = cur.fetchone()[0]
 
                     step_order_key = str(step.get("step_order"))
-                    materials = step_materials_map.get(step_order_key, [])
-                    logging.info(f"  └─ Step {step_order_key} '{step.get('step_name')}' → {len(materials)} material(s)")
+                    refs_for_step = step_materials_map.get(step_order_key, [])
+                    logging.info(
+                        f"  └─ Step {step_order_key} '{step.get('step_name')}' "
+                        f"→ {len(refs_for_step)} ref(s)"
+                    )
 
-                    for ref in materials:
-                        cur.execute(
-                            "SELECT matiere_id FROM public.matieres WHERE reference = %s",
-                            (ref,)
-                        )
-                        mat_row = cur.fetchone()
-                        if not mat_row:
-                            logging.warning(f"    ⚠️  step_materials ref '{ref}' not in matieres, skipping")
+                    # Deduplicate by (type, id) to prevent unique constraint violation.
+                    # This handles cases like 6600071 appearing twice in the same step
+                    # (e.g. once as "Lösung" and once as "Spülen") — they share the
+                    # same matiere_id so only the first occurrence is inserted.
+                    seen_step_ids: set = set()
+
+                    for ref in refs_for_step:
+                        if not ref:
                             continue
-                        cur.execute(
-                            "INSERT INTO public.black_mix_step_materials (process_step_id, matiere_id) VALUES (%s, %s)",
-                            (process_step_id, mat_row[0])
-                        )
+
+                        resolved = resolve_step_material_ref(cur, ref)
+
+                        if resolved is None:
+                            logging.warning(
+                                f"    ⚠️  step_materials ref '{ref}' not found "
+                                f"in matieres or black_mixes, skipping"
+                            )
+                            continue
+
+                        # Build dedup key: ("material", matiere_id) or ("black_mix", bm_id)
+                        if resolved["type"] == "material":
+                            dedup_key = ("material", resolved["matiere_id"])
+                        else:
+                            dedup_key = ("black_mix", resolved["sub_black_mix_id"])
+
+                        if dedup_key in seen_step_ids:
+                            logging.debug(
+                                f"    ↩  Skipping duplicate step-material: "
+                                f"ref='{ref}' key={dedup_key}"
+                            )
+                            continue
+
+                        seen_step_ids.add(dedup_key)
+
+                        if resolved["type"] == "material":
+                            cur.execute(
+                                """INSERT INTO public.black_mix_step_materials
+                                   (process_step_id, matiere_id)
+                                   VALUES (%s, %s)""",
+                                (process_step_id, resolved["matiere_id"])
+                            )
+                        else:
+                            # Sub-black-mix in a step
+                            cur.execute(
+                                """INSERT INTO public.black_mix_step_materials
+                                   (process_step_id, sub_black_mix_id)
+                                   VALUES (%s, %s)""",
+                                (process_step_id, resolved["sub_black_mix_id"])
+                            )
+
                         total_step_materials += 1
 
                 logging.info(f"  └─ {total_step_materials} step-material links inserted")
@@ -1319,12 +1509,13 @@ def list_black_mixes():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT id, reference, name, status, created_at
-                   FROM public.black_mixes ORDER BY created_at DESC"""
+                "SELECT id, reference, name, status, created_at FROM public.black_mixes ORDER BY created_at DESC"
             )
             black_mixes = [
-                {"id": r[0], "product_reference": r[1], "mix_name": r[2],
-                 "status": r[3], "created_at": r[4].isoformat() if r[4] else None}
+                {
+                    "id": r[0], "product_reference": r[1], "mix_name": r[2],
+                    "status": r[3], "created_at": r[4].isoformat() if r[4] else None
+                }
                 for r in cur.fetchall()
             ]
         return jsonify({"success": True, "black_mixes": black_mixes}), 200
@@ -1355,7 +1546,7 @@ def get_black_mix_details(mix_id):
                 "document_revision_history": row[5]
             }
 
-            # Components — now with sub-mix awareness
+            # Components — with sub-mix awareness
             cur.execute(
                 """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
                           c.matiere_id, c.sub_black_mix_id, c.metadata,
@@ -1364,7 +1555,8 @@ def get_black_mix_details(mix_id):
                    FROM public.black_mix_components c
                    LEFT JOIN public.matieres m ON c.matiere_id = m.matiere_id
                    LEFT JOIN public.black_mixes bm ON c.sub_black_mix_id = bm.id
-                   WHERE c.black_mix_id = %s""",
+                   WHERE c.black_mix_id = %s
+                   ORDER BY c.id""",
                 (mix_id,)
             )
             components = []
@@ -1390,22 +1582,38 @@ def get_black_mix_details(mix_id):
                     })
             result["components"] = components
 
-            # Process steps
+            # Process steps — with sub-mix refs in materials list
             cur.execute(
-                """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
-                          ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
+                """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters
                    FROM public.black_mix_process_steps s
-                   LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
-                   LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
                    WHERE s.black_mix_id = %s
-                   GROUP BY s.id ORDER BY s.step_order""",
+                   ORDER BY s.step_order""",
                 (mix_id,)
             )
-            result["process_steps"] = [
-                {"step_order": r[1], "step_name": r[2], "machine": r[3], "parameters": r[4],
-                 "materials": list(r[5]) if r[5] and r[5][0] is not None else []}
-                for r in cur.fetchall()
-            ]
+            steps_raw = cur.fetchall()
+            process_steps = []
+            for s in steps_raw:
+                step_id, step_order, step_name, machine, parameters = s
+                cur.execute(
+                    """SELECT sm.matiere_id, sm.sub_black_mix_id,
+                              m.reference AS mat_ref, bm.reference AS sub_bm_ref
+                       FROM public.black_mix_step_materials sm
+                       LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
+                       LEFT JOIN public.black_mixes bm ON bm.id = sm.sub_black_mix_id
+                       WHERE sm.process_step_id = %s""",
+                    (step_id,)
+                )
+                mat_refs = []
+                for sm in cur.fetchall():
+                    ref = sm[3] if sm[1] is not None else sm[2]
+                    if ref:
+                        mat_refs.append(ref)
+                process_steps.append({
+                    "step_order": step_order, "step_name": step_name,
+                    "machine": machine, "parameters": parameters,
+                    "materials": mat_refs
+                })
+            result["process_steps"] = process_steps
 
             # Control plan
             cur.execute(
@@ -1414,11 +1622,13 @@ def get_black_mix_details(mix_id):
                 (mix_id,)
             )
             result["control_plan"] = [
-                {"parameter_name": r[0],
-                 "target_value": float(r[1]) if r[1] is not None else None,
-                 "min_value": float(r[2]) if r[2] is not None else None,
-                 "max_value": float(r[3]) if r[3] is not None else None,
-                 "unit": r[4]}
+                {
+                    "parameter_name": r[0],
+                    "target_value": float(r[1]) if r[1] is not None else None,
+                    "min_value":    float(r[2]) if r[2] is not None else None,
+                    "max_value":    float(r[3]) if r[3] is not None else None,
+                    "unit": r[4]
+                }
                 for r in cur.fetchall()
             ]
 
@@ -1438,7 +1648,8 @@ def get_black_mix_adn(mix_id):
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT id, black_mix_id, adn_text, version, created_at
-                   FROM public.black_mix_adn WHERE black_mix_id = %s""",
+                   FROM public.black_mix_adn WHERE black_mix_id = %s
+                   ORDER BY version DESC LIMIT 1""",
                 (mix_id,)
             )
             row = cur.fetchone()
