@@ -772,17 +772,23 @@ def upload_temp_pdf_and_ocr():
         return jsonify({"success": False, "error": "JSON required"}), 400
     data = request.get_json(silent=True) or {}
 
-    # ── Unified file reference : openairefid ─────────────────────────────────
-    openairefid    = data.get("openairefid") or {}
-    openai_file_id = openairefid.get("id")
-    original_name  = openairefid.get("name") or "uploaded.pdf"
-    download_link  = openairefid.get("download_link")
+    # ── openaiFileIdRefs (liste) ──────────────────────────────────────────────
+    refs = data.get("openaiFileIdRefs")
+    download_link = None
+    openai_file_id = None
+    original_name = "uploaded.pdf"
+
+    if refs and isinstance(refs, list) and len(refs) > 0:
+        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
+        download_link  = first_ref.get("download_link")
+        openai_file_id = first_ref.get("id")
+        original_name  = first_ref.get("name") or "uploaded.pdf"
     # ─────────────────────────────────────────────────────────────────────────
 
     max_pages = int(data.get("max_pages", 20))
 
     if not download_link and not openai_file_id:
-        return jsonify({"success": False, "error": "openairefid must contain 'id' or 'download_link'"}), 400
+        return jsonify({"success": False, "error": "openaiFileIdRefs must contain 'id' or 'download_link'"}), 400
 
     timestamp = int(time.time())
     temp_path = None
