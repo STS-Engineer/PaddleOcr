@@ -771,23 +771,18 @@ def upload_temp_pdf_and_ocr():
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON required"}), 400
     data = request.get_json(silent=True) or {}
-    refs = data.get("openaiFileIdRefs")
-    download_link = data.get("download_link")
-    openai_file_id = data.get("openai_file_id")
-    max_pages = int(data.get("max_pages", 20))
-    original_name = data.get("filename") or "uploaded.pdf"
 
-    if refs and isinstance(refs, list) and len(refs) > 0:
-        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
-        if first_ref.get("download_link"):
-            download_link = first_ref["download_link"]
-        if first_ref.get("id") and not openai_file_id:
-            openai_file_id = first_ref["id"]
-        if first_ref.get("name"):
-            original_name = first_ref["name"]
+    # ── Unified file reference : openairefid ─────────────────────────────────
+    openairefid    = data.get("openairefid") or {}
+    openai_file_id = openairefid.get("id")
+    original_name  = openairefid.get("name") or "uploaded.pdf"
+    download_link  = openairefid.get("download_link")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    max_pages = int(data.get("max_pages", 20))
 
     if not download_link and not openai_file_id:
-        return jsonify({"success": False, "error": "Provide download_link or openai_file_id"}), 400
+        return jsonify({"success": False, "error": "openairefid must contain 'id' or 'download_link'"}), 400
 
     timestamp = int(time.time())
     temp_path = None
@@ -840,17 +835,22 @@ def upload_temp_pdf_and_ocr():
         if original_name and ("SDS" in original_name.upper() or "MSDS" in original_name.upper()):
             reference = extract_reference_from_msds_filename(original_name)
         return jsonify({
-            "success": True, "openai_file_id": openai_file_id,
-            "download_link_used": bool(download_link), "material_name": material_name,
-            "reference": reference, "total_pages": total_pages,
-            "converted_pages": len(processed_pages), "truncated": total_pages > max_pages,
-            "pages": processed_pages, "temp_filename": temp_filename,
-            "temp_url": temp_url, "expires_in_seconds": 1800
+            "success": True,
+            "openai_file_id": openai_file_id,
+            "download_link_used": bool(download_link),
+            "material_name": material_name,
+            "reference": reference,
+            "total_pages": total_pages,
+            "converted_pages": len(processed_pages),
+            "truncated": total_pages > max_pages,
+            "pages": processed_pages,
+            "temp_filename": temp_filename,
+            "temp_url": temp_url,
+            "expires_in_seconds": 1800
         }), 200
     except Exception as e:
         logging.error(f"Upload+OCR failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/process-pdf-to-ocr", methods=["POST"])
 def process_pdf_to_ocr():
