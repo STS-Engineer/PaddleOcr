@@ -307,6 +307,7 @@ def run_paddle_ocr_on_file(img_path: Path):
         logging.exception(f"PaddleOCR failed on {img_path}")
         return []
 
+import numpy as np  # REQUIRED
 
 @app.route("/upload-temp-image", methods=["POST"])
 def upload_temp_image():
@@ -314,24 +315,70 @@ def upload_temp_image():
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
-    download_link, openai_file_id, original_name = extract_pdf_source(data)
 
+    # 🔹 Extract openaiFileIdRefs
+    refs = data.get("openaiFileIdRefs")
+    if not refs or not isinstance(refs, list) or len(refs) == 0:
+        return jsonify({"success": False, "error": "Missing openaiFileIdRefs"}), 400
+
+    file_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
+
+    download_link = file_ref.get("download_link")
+    openai_file_id = file_ref.get("id")
+    original_name = file_ref.get("name") or "uploaded_image.jpg"
+    mime_type = file_ref.get("mime_type")
+
+    # 🔹 Validate input
     if not download_link and not openai_file_id:
-        return jsonify({"success": False, "error": "Provide download_link or openai_file_id"}), 400
+        return jsonify({
+            "success": False,
+            "error": "openaiFileIdRefs must contain 'id' or 'download_link'"
+        }), 400
 
     try:
-        image_bytes, original_name = fetch_pdf_bytes(
-            download_link=download_link,
-            openai_file_id=openai_file_id,
-            original_name=original_name
-        )
+        image_bytes = None
+
+        # ✅ PRIORITY 1: download_link
+        if download_link:
+            r = requests.get(download_link, timeout=30)
+            if r.status_code != 200:
+                return jsonify({
+                    "success": False,
+                    "error": f"Download failed (status={r.status_code})"
+                }), 400
+            image_bytes = r.content
+
+        # ✅ PRIORITY 2: OpenAI file id fallback
+        if image_bytes is None and openai_file_id:
+            meta = client.files.retrieve(openai_file_id)
+            if getattr(meta, "filename", None):
+                original_name = meta.filename
+            image_bytes = client.files.content(openai_file_id).read()
+
+        if image_bytes is None:
+            return jsonify({"success": False, "error": "Unable to retrieve image"}), 400
+
+        # 🔹 Decode image safely
         image_array = np.frombuffer(image_bytes, dtype=np.uint8)
         decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-        if decoded_image is None:
-            return jsonify({"success": False, "error": "Downloaded file is not a valid image"}), 400
 
+        if decoded_image is None:
+            return jsonify({
+                "success": False,
+                "error": "Downloaded file is not a valid image"
+            }), 400
+
+        # 🔹 Optional MIME validation
+        if mime_type and not mime_type.startswith("image/"):
+            return jsonify({
+                "success": False,
+                "error": "File is not an image"
+            }), 400
+
+        # 🔹 Save image
         safe_name = secure_filename(original_name) or "uploaded_image"
         image_stem = Path(safe_name).stem or "uploaded_image"
+
         timestamp = int(time.time())
         image_filename = f"{image_stem}_{timestamp}_{uuid.uuid4().hex}.jpg"
         image_path = OUTPUT_FOLDER / image_filename
@@ -339,6 +386,7 @@ def upload_temp_image():
         if not cv2.imwrite(str(image_path), decoded_image):
             return jsonify({"success": False, "error": "Failed to save image"}), 500
 
+        # 🔹 Auto-delete later
         Thread(target=delete_file_after_delay, args=(image_path,), daemon=True).start()
 
         return jsonify({
@@ -351,8 +399,7 @@ def upload_temp_image():
             "download_image_url": f"{request.host_url.rstrip('/')}/download-image/{image_filename}",
             "expires_in_seconds": TEMP_ENDPOINT_EXPIRY_SECONDS
         }), 200
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+
     except Exception as e:
         logging.error(f"Temp image upload failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
