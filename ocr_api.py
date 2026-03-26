@@ -308,6 +308,55 @@ def run_paddle_ocr_on_file(img_path: Path):
         return []
 
 
+@app.route("/upload-temp-image", methods=["POST"])
+def upload_temp_image():
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON required"}), 400
+
+    data = request.get_json(silent=True) or {}
+    download_link, openai_file_id, original_name = extract_pdf_source(data)
+
+    if not download_link and not openai_file_id:
+        return jsonify({"success": False, "error": "Provide download_link or openai_file_id"}), 400
+
+    try:
+        image_bytes, original_name = fetch_pdf_bytes(
+            download_link=download_link,
+            openai_file_id=openai_file_id,
+            original_name=original_name
+        )
+        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if decoded_image is None:
+            return jsonify({"success": False, "error": "Downloaded file is not a valid image"}), 400
+
+        safe_name = secure_filename(original_name) or "uploaded_image"
+        image_stem = Path(safe_name).stem or "uploaded_image"
+        timestamp = int(time.time())
+        image_filename = f"{image_stem}_{timestamp}_{uuid.uuid4().hex}.jpg"
+        image_path = OUTPUT_FOLDER / image_filename
+
+        if not cv2.imwrite(str(image_path), decoded_image):
+            return jsonify({"success": False, "error": "Failed to save image"}), 500
+
+        Thread(target=delete_file_after_delay, args=(image_path,), daemon=True).start()
+
+        return jsonify({
+            "success": True,
+            "openai_file_id": openai_file_id,
+            "download_link_used": bool(download_link),
+            "original_filename": original_name,
+            "image_filename": image_filename,
+            "image_url": f"{request.host_url.rstrip('/')}/images/{image_filename}",
+            "download_image_url": f"{request.host_url.rstrip('/')}/download-image/{image_filename}",
+            "expires_in_seconds": TEMP_ENDPOINT_EXPIRY_SECONDS
+        }), 200
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"Temp image upload failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # =====================================================================
 # NESTED BLACK MIX HELPERS
 # =====================================================================
